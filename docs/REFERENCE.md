@@ -51,6 +51,17 @@ except ConnectError as exc:
 The narrower exception must come first because `CompatibilityError` is a `ConnectError`.
 Catch only `ConnectError` when one recovery path should handle every connection failure.
 
+Before opening a control connection, `udp` and `hybrid` read the robot model and Robot OS
+version from Asimov Edge, while `livekit` asks Edge over the room RPC. Failure to acquire
+those facts raises `ConnectError`; malformed or unsupported facts raise
+`CompatibilityError`. The failed connection leaves no control transport open, and the same
+`Robot` can retry.
+
+`UdpConfig(version_port=..., version_timeout=...)` changes the Edge version endpoint.
+`allow_unsupported_target=True` admits a valid unsupported target for development, but does
+not waive payload validation. `require_state=False` still checks compatibility;
+`allow_version_skew=True` applies only to the protocol version in the first state packet.
+
 ## Connection modes
 
 | `connect(mode)` | control + state | camera + audio | needs a LiveKit server | config slots |
