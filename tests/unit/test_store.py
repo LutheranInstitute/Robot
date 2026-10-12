@@ -187,9 +187,7 @@ def test_the_default_connection_mode_follows_the_slots_that_are_set():
 
 def test_connect_with_no_mode_uses_the_one_lane_the_config_has(edge):
     cfg = ConnectionConfig(
-        udp=UdpConfig(
-            "127.0.0.1", command_port=edge.command_port, state_bind=("127.0.0.1", edge.state_port)
-        )
+        udp=UdpConfig("127.0.0.1", command_port=edge.command_port, state_bind=("127.0.0.1", 0))
     )
     with Robot(cfg).connect(timeout=3.0) as robot:
         assert robot.info.transport == "udp"
@@ -250,9 +248,7 @@ def test_a_failed_connect_never_writes_the_store(edge, manager, monkeypatch):
 
 def test_persist_needs_a_manager_and_says_so_before_any_io(edge):
     cfg = ConnectionConfig(
-        udp=UdpConfig(
-            "127.0.0.1", command_port=edge.command_port, state_bind=("127.0.0.1", edge.state_port)
-        )
+        udp=UdpConfig("127.0.0.1", command_port=edge.command_port, state_bind=("127.0.0.1", 0))
     )
     with pytest.raises(ValueError, match="needs a ManagerConfig"):
         Robot(cfg).connect("udp", persist=True)

@@ -164,17 +164,18 @@ def test_goto_wait_times_out_when_the_robot_does_not_follow(edge, robot):
         robot.set_joints(_pose(0.5), duration=0.2, hz=20, wait=True, timeout=0.5)
 
 
-def test_alerts_sent_every_20th_frame_are_carried_forward_for_stable_reads():
+def test_alerts_sent_every_20th_frame_are_carried_forward_for_stable_reads(monkeypatch):
     """The firmware includes its alert block in 1 of 20 frames. Per-sample reads must not
     flicker, on_alert must fire once per transition, and a fault must be seen every sample."""
-    from tests.conftest import FakeEdge
+    from tests.conftest import FakeEdge, route_udp_to
 
     edge = FakeEdge(state_hz=200.0, alerts_every=20)
+    route_udp_to(edge, monkeypatch)
     try:
         with connect_udp(
             "127.0.0.1",
             command_port=edge.command_port,
-            state_bind=("127.0.0.1", edge.state_port),
+            state_bind=("127.0.0.1", 0),
             timeout=2,
         ) as robot:
             events = []

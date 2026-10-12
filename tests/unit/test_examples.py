@@ -33,8 +33,14 @@ import pytest
 
 import menlo.asimov
 from menlo.asimov import Frame, UdpConfig, _version, connection, store
-from menlo.asimov.transport.livekit import HybridTransport, LiveKitTransport
-from tests.conftest import FakeEdge, FakeLiveKitClient, FakeManager
+from menlo.asimov.transport.livekit import LiveKitTransport
+from tests.conftest import (
+    FakeEdge,
+    FakeLiveKitClient,
+    FakeManager,
+    SeamHybridTransport,
+    route_udp_to,
+)
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 CREDENTIAL = "eyJpZCI6ImEwY2QxNmRiIn0.secret"
@@ -70,8 +76,9 @@ def idle(seconds: float, tick: float = 0.1) -> list[None]:
 
 
 @pytest.fixture
-def fw_edge() -> Iterator[FakeEdge]:
+def fw_edge(monkeypatch) -> Iterator[FakeEdge]:
     e = FakeEdge(firmware=True, state_hz=200.0)
+    route_udp_to(e, monkeypatch)
     e.state.joint_temp.extend([35.0] * 25)
     e.state.base_ang_vel.extend([0.0, 0.0, 0.0])
     yield e
@@ -90,12 +97,12 @@ def rooms(fw_edge, monkeypatch) -> list[FakeLiveKitClient]:
             clients.append(client)
             super().__init__(url, room, token=token, client=client, **kw)
 
-    class Hybrid(HybridTransport):
+    class Hybrid(SeamHybridTransport):
         def __init__(self, host, *, livekit_url, room, token, **kw):
             client = FakeLiveKitClient(fw_edge, carry_state=False)
             clients.append(client)
             super().__init__(
-                host, livekit_url=livekit_url, room=room, token=token, client=client, **kw
+                fw_edge, host, livekit_url=livekit_url, room=room, token=token, client=client, **kw
             )
 
     monkeypatch.setattr(connection, "LiveKitTransport", Room)
@@ -155,7 +162,7 @@ def run(fw_edge, monkeypatch, tmp_path, capsys) -> Run:
         return UdpConfig(
             host,
             command_port=fw_edge.command_port,
-            state_bind=("127.0.0.1", fw_edge.state_port),
+            state_bind=("127.0.0.1", 0),
         )
 
     monkeypatch.setattr(menlo.asimov, "UdpConfig", at_fake_edge)

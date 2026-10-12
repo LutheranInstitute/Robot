@@ -15,7 +15,7 @@ from menlo.asimov import (
     UdpConfig,
     _version,
 )
-from menlo.asimov.transport.udp import UdpTransport
+from tests.conftest import SeamUdpTransport
 
 
 @pytest.fixture
@@ -26,7 +26,7 @@ def target_robot(edge, monkeypatch, version_document_fetch):
         udp=UdpConfig(
             "127.0.0.1",
             command_port=edge.command_port,
-            state_bind=("127.0.0.1", edge.state_port),
+            state_bind=("127.0.0.1", 0),
             version_port=edge.version.port,
             version_timeout=0.15,
         ),
@@ -243,12 +243,7 @@ def test_transport_bound_udp_checks_target_before_opening_socket(
     """Robot(UdpTransport(...)) cannot bypass the HTTP target check."""
     monkeypatch.setattr(_version, "_fetch_version_document", version_document_fetch)
     edge.version.body = b'{"robot_model":"future_robot","robot_os_version":"9.8.7"}'
-    tx = UdpTransport(
-        "127.0.0.1",
-        command_port=edge.command_port,
-        state_bind=("127.0.0.1", edge.state_port),
-        version_port=edge.version.port,
-    )
+    tx = SeamUdpTransport(edge, version_port=edge.version.port)
     robot = Robot(tx)
     with pytest.raises(CompatibilityError, match="unsupported robot target"):
         robot.open(require_state=False)

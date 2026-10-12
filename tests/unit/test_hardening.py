@@ -36,8 +36,8 @@ from menlo.asimov import (
 from menlo.asimov._command import Velocity
 from menlo.asimov.transport import _livekit_client
 from menlo.asimov.transport._livekit_client import _LiveKitClient
-from menlo.asimov.transport.udp import UdpTransport, state_from_robot_state
-from tests.conftest import put_in, route_manager_rooms_to
+from menlo.asimov.transport.udp import state_from_robot_state
+from tests.conftest import SeamUdpTransport, put_in, route_manager_rooms_to
 
 CRED = "eyJpZCI6ImEwY2QxNmRiIn0.secret"
 
@@ -219,9 +219,7 @@ def test_a_sample_arriving_while_open_is_still_running_is_handshaken(edge, monke
     time.sleep(0.05)
 
     def robot_over(protocol: int | None):
-        tx = UdpTransport(
-            "127.0.0.1", command_port=edge.command_port, state_bind=("127.0.0.1", edge.state_port)
-        )
+        tx = SeamUdpTransport(edge)
         r = Robot(tx)
         real_open = tx.open
 

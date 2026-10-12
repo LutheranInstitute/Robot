@@ -158,7 +158,7 @@ def test_battery_is_a_capability_when_the_robot_reports_one(edge):
     with connect_udp(
         "127.0.0.1",
         command_port=edge.command_port,
-        state_bind=("127.0.0.1", edge.state_port),
+        state_bind=("127.0.0.1", 0),
         timeout=2,
     ) as r:
         assert r.has("battery")

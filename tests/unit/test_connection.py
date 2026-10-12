@@ -23,7 +23,12 @@ from menlo.asimov import (
 )
 from menlo.asimov.connection import MODES
 from menlo.asimov.transport import HybridTransport, LiveKitTransport, UdpTransport
-from tests.conftest import FakeLiveKitClient, FakeManager, route_manager_rooms_to
+from tests.conftest import (
+    FakeLiveKitClient,
+    FakeManager,
+    SeamHybridTransport,
+    route_manager_rooms_to,
+)
 
 # ── the config itself ─────────────────────────────────────────────────────────
 
@@ -228,7 +233,7 @@ class _FakeLanes(ConnectionConfig):
             UdpConfig(
                 "127.0.0.1",
                 command_port=edge.command_port,
-                state_bind=("127.0.0.1", edge.state_port),
+                state_bind=("127.0.0.1", 0),
                 version_port=edge.version.port,
             ),
         )
@@ -260,13 +265,11 @@ class _FakeLanes(ConnectionConfig):
                 allow_unsupported_target=allow_unsupported_target,
                 client=client,
             )
-        return HybridTransport(
-            "127.0.0.1",
+        return SeamHybridTransport(
+            self._edge,
             livekit_url="ws://fake",
             room="asimov-room",
             token="t",
-            command_port=self._edge.command_port,
-            state_bind=("127.0.0.1", self._edge.state_port),
             version_port=self._edge.version.port,
             client=client,
         )
@@ -434,9 +437,7 @@ def test_connect_while_connected_raises_and_leaves_the_session_alone(edge):
 
 def test_a_mode_the_config_cannot_carry_fails_before_the_network(edge):
     cfg = ConnectionConfig(
-        udp=UdpConfig(
-            "127.0.0.1", command_port=edge.command_port, state_bind=("127.0.0.1", edge.state_port)
-        )
+        udp=UdpConfig("127.0.0.1", command_port=edge.command_port, state_bind=("127.0.0.1", 0))
     )
     robot = Robot(cfg)
     with pytest.raises(ConnectError, match="needs the livekit slot"):

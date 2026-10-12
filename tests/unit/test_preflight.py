@@ -30,7 +30,7 @@ from menlo.asimov import (
     WaitTimeoutError,
 )
 from menlo.asimov._preflight import evaluate
-from tests.conftest import FakeEdge, connect_udp, put_in
+from tests.conftest import FakeEdge, connect_udp, put_in, route_udp_to
 
 
 def _state(
@@ -172,8 +172,9 @@ def test_problem_reads_well():
 
 
 @pytest.fixture
-def fw_edge():
+def fw_edge(monkeypatch):
     e = FakeEdge(firmware=True, state_hz=200.0)
+    route_udp_to(e, monkeypatch)
     yield e
     e.close()
 
@@ -182,7 +183,7 @@ def _robot(edge: FakeEdge):
     return connect_udp(
         "127.0.0.1",
         command_port=edge.command_port,
-        state_bind=("127.0.0.1", edge.state_port),
+        state_bind=("127.0.0.1", 0),
         timeout=3.0,
     )
 
@@ -241,7 +242,7 @@ def test_balance_that_never_reaches_move_times_out_naming_the_robot_mode(edge):
     robot = connect_udp(
         "127.0.0.1",
         command_port=edge.command_port,
-        state_bind=("127.0.0.1", edge.state_port),
+        state_bind=("127.0.0.1", 0),
         timeout=3.0,
     )
     with robot:
@@ -524,7 +525,7 @@ def test_damp_that_is_not_reported_times_out_naming_the_robot_mode(edge):
     robot = connect_udp(
         "127.0.0.1",
         command_port=edge.command_port,
-        state_bind=("127.0.0.1", edge.state_port),
+        state_bind=("127.0.0.1", 0),
         timeout=3.0,
     )
     with robot:

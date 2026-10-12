@@ -29,7 +29,7 @@ from menlo.asimov import (
     WaitTimeoutError,
 )
 from menlo.asimov.robot import KEEPALIVE_HZ
-from tests.conftest import connect_udp, put_in
+from tests.conftest import SeamUdpTransport, connect_udp, put_in
 
 # ── connect ───────────────────────────────────────────────────────────────────
 
@@ -79,14 +79,14 @@ def test_connect_refuses_a_protocol_version_it_was_not_built_for(edge):
         connect_udp(
             "127.0.0.1",
             command_port=edge.command_port,
-            state_bind=("127.0.0.1", edge.state_port),
+            state_bind=("127.0.0.1", 0),
             timeout=2,
         )
     assert exc.value.observed == 99 and exc.value.expected == 1
     r = connect_udp(
         "127.0.0.1",
         command_port=edge.command_port,
-        state_bind=("127.0.0.1", edge.state_port),
+        state_bind=("127.0.0.1", 0),
         timeout=2,
         allow_version_skew=True,
     )
@@ -322,7 +322,7 @@ def test_with_block_closes_and_the_state_names_joints(edge):
     with connect_udp(
         "127.0.0.1",
         command_port=edge.command_port,
-        state_bind=("127.0.0.1", edge.state_port),
+        state_bind=("127.0.0.1", 0),
         timeout=2,
     ) as r:
         assert r.get_state().joint("L_Knee").pos == 0.0
@@ -455,7 +455,8 @@ def test_a_foreign_state_datagram_does_not_keep_the_link_alive(edge, robot, payl
     robot.link_timeout = 0.3
     edge.pushing = False
     stop = threading.Event()
-    t = threading.Thread(target=_spam_state_port, args=(edge.state_port, payload, stop))
+    port = robot._tx._sock.getsockname()[1]  # the SDK's state port, as it was bound
+    t = threading.Thread(target=_spam_state_port, args=(port, payload, stop))
     t.start()
     try:
         time.sleep(0.9)
@@ -487,11 +488,8 @@ def test_a_fault_in_an_unknown_mode_still_fails_fast(edge, robot):
 
 def test_the_host_is_resolved_once_at_open(edge):
     from menlo.asimov.transport.udp import UdpTransport
-    from tests.conftest import _free_port
 
-    tx = UdpTransport(
-        "localhost", command_port=edge.command_port, state_bind=("127.0.0.1", _free_port())
-    )
+    tx = UdpTransport("localhost", command_port=edge.command_port, state_bind=("127.0.0.1", 0))
     assert tx._addr is None
     tx.open()
     try:
@@ -542,7 +540,7 @@ def test_a_resolved_outcome_leaves_the_pending_table(edge, robot):
 
 
 def test_state_source_allowlist_drops_everyone_else(edge):
-    kw = dict(command_port=edge.command_port, state_bind=("127.0.0.1", edge.state_port))
+    kw = dict(command_port=edge.command_port, state_bind=("127.0.0.1", 0))
     with pytest.raises(ConnectError):
         connect_udp("127.0.0.1", timeout=0.5, state_source="10.255.255.1", **kw)
     with connect_udp("127.0.0.1", timeout=2.0, state_source="localhost", **kw) as r:
@@ -716,7 +714,7 @@ def test_connect_direct_takes_link_timeout(edge):
     with connect_udp(
         "127.0.0.1",
         command_port=edge.command_port,
-        state_bind=("127.0.0.1", edge.state_port),
+        state_bind=("127.0.0.1", 0),
         timeout=2.0,
         link_timeout=0.7,
     ) as r:
@@ -810,14 +808,8 @@ def test_a_velocity_attempted_during_a_failed_open_never_reaches_the_next_sessio
     attempt is cleared, so a reconnect cannot walk the robot off by itself."""
     import threading
 
-    from menlo.asimov.transport.udp import UdpTransport
-
     edge.pushing = False
-    robot = Robot(
-        UdpTransport(
-            "127.0.0.1", command_port=edge.command_port, state_bind=("127.0.0.1", edge.state_port)
-        )
-    )
+    robot = Robot(SeamUdpTransport(edge))
     stop = threading.Event()
     refused = []
 
@@ -927,3 +919,18 @@ def test_ctrl_c_during_a_waited_walk_zeroes_the_velocity(edge, robot):
     n = len(edge.received)
     time.sleep(3 / KEEPALIVE_HZ)
     assert len(edge.received) == n, "and nothing is re-sent after the zero"
+
+
+# ── the fixture's own promise ────────────────────────────────────────────────
+
+
+def test_the_edge_pushes_to_the_port_the_sdk_bound(edge, any_robot):
+    """On every lane, the fake edge pushes state to the socket the SDK side bound to port
+    0 (the transport's, or the fake room's), learned once it was bound: the edge never
+    chose that port, and state flows there."""
+    mode, robot = any_robot
+    tx = robot._tx
+    sock = tx._sock if mode == "udp" else tx._udp._sock if mode == "hybrid" else tx._lk._sock
+    bound = sock.getsockname()
+    assert bound[1] != 0 and edge.destination == bound, "learned from the bound socket"
+    assert robot.connected and robot.get_state().age_s < 1.0, "and state flows there"

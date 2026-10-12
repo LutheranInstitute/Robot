@@ -1,4 +1,12 @@
-"""Shared fixtures: a fake edge that speaks the real wire, and a live-rig gate."""
+"""Shared fixtures: a fake edge that speaks the real wire, and a live-rig gate.
+
+Every socket a test opens is bound to port 0 and kept: the kernel picks a free port and
+the socket owns it from then on. No port number is ever reserved and released, so two
+parties cannot end up on one port. The fake edge binds one socket, reports its port
+(``command_port``), and pushes state from that same socket; the SDK binds its state
+socket to port 0 and the transport seams below tell the edge where it landed
+(``push_to``) once it is bound, before ``Robot.open`` starts waiting for state.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +19,7 @@ import time
 from collections.abc import Callable
 from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -22,14 +31,6 @@ from menlo.asimov.transport.udp import UdpTransport
 #: ``CONTROL_MODE_FAULT_DAMP``, by value: asimov.io protocol v1.3.0 adds it, and the SDK
 #: reads robot modes by value, so it works whatever version of the bindings is installed.
 FAULT_DAMP = 5
-
-
-def _free_port() -> int:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def ankle_coupling(positions: list[float]) -> list[float]:
@@ -50,8 +51,10 @@ class FakeEdge:
     ``RobotState`` pushed out to a configured host at a configured rate.
 
     Deliberately shaped like Asimov Edge's ``UdpConnector`` (sender address ignored,
-    state to ONE destination), so a test that passes here says something about the robot.
-    Records every decoded command; the state it pushes is whatever the test sets.
+    state to ONE destination, one socket for both), so a test that passes here says
+    something about the robot. Records every decoded command; the state it pushes is
+    whatever the test sets. The destination is learned from the SDK side once it has
+    bound its state socket (``push_to``); until then nothing is pushed.
 
     ``firmware=True`` makes the robot mode follow the commands the way the Motion Control
     Board firmware does: STAND and DAMP take effect at once; MOVE (a velocity or a
@@ -77,8 +80,6 @@ class FakeEdge:
         pb = load()  # same bindings the SDK uses, whichever source it resolved to
         self._cmd_pb, self._common_pb, self._st_pb = pb.command, pb.common, pb.state
         self._version: FakeVersionEndpoint | None = None
-        self.command_port = _free_port()
-        self.state_port = _free_port()
         self.received: list = []  # decoded RobotCommand protos, in arrival order
         self.arrived: list[float] = []  # monotonic receipt time of each entry in received
         self.state = self._st_pb.RobotState(
@@ -99,8 +100,11 @@ class FakeEdge:
         self._hz = state_hz
         self._stop = threading.Event()
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.bind(("127.0.0.1", self.command_port))
+        self._sock.bind(("127.0.0.1", 0))  # the kernel picks the port; the socket keeps it
         self._sock.settimeout(0.05)
+        self.command_port: int = self._sock.getsockname()[1]
+        #: Where state is pushed: the SDK's bound state socket, once it has said where.
+        self.destination: tuple[str, int] | None = None
         self._rx = threading.Thread(target=self._recv, daemon=True)
         self._tx = threading.Thread(target=self._push, daemon=True)
         self._rx.start()
@@ -189,13 +193,13 @@ class FakeEdge:
             self._enter(FAULT_DAMP)
 
     def _push(self) -> None:
-        out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         period = 1.0 / self._hz
         seq = 0
         while not self._stop.is_set():
             if self.firmware:
                 self._arm_tick()
-            if self.pushing:
+            dest = self.destination
+            if self.pushing and dest is not None:
                 seq += 1
                 self.state.sequence = seq
                 self.state.timestamp_us = int(time.time() * 1e6)
@@ -203,11 +207,16 @@ class FakeEdge:
                     frame = self._st_pb.RobotState()
                     frame.CopyFrom(self.state)
                     del frame.active_alerts[:]
-                    out.sendto(frame.SerializeToString(), ("127.0.0.1", self.state_port))
+                    payload = frame.SerializeToString()
                 else:
-                    out.sendto(self.state.SerializeToString(), ("127.0.0.1", self.state_port))
+                    payload = self.state.SerializeToString()
+                with suppress(OSError):  # the destination may have closed between checks
+                    self._sock.sendto(payload, dest)  # from the one bound socket, as the edge
             time.sleep(period)
-        out.close()
+
+    def push_to(self, address: tuple[str, int]) -> None:
+        """State goes to ``address`` from now on: the SDK's state socket, as it was bound."""
+        self.destination = (address[0], int(address[1]))
 
     # ── test helpers ─────────────────────────────────────────────────────────
     def set_mode(self, mode: str) -> None:
@@ -262,14 +271,16 @@ def connect_udp(
     host: str,
     *,
     command_port: int = 8850,
-    state_bind: tuple[str, int] = ("0.0.0.0", 8851),
+    state_bind: tuple[str, int] = ("127.0.0.1", 0),
     state_source: str | None = None,
     limits=None,
     link_timeout: float | None = None,
     **connect_kw,
 ) -> Robot:
     """``Robot(ConnectionConfig(udp=...)).connect("udp", ...)`` in one call, for tests that
-    only care about the UDP lane."""
+    only care about the UDP lane. The ``udp`` lane the config builds is a
+    :class:`SeamUdpTransport` when an ``edge`` fixture (or ``route_udp_to``) is in force,
+    so the edge learns the state port the SDK binds."""
     from menlo.asimov.connection import ConnectionConfig, UdpConfig
 
     cfg = ConnectionConfig(
@@ -292,30 +303,71 @@ def put_in(robot: Robot, edge: FakeEdge, mode: str) -> None:
     robot.wait_until(lambda s: s.mode.name == mode.upper(), timeout=2.0)
 
 
-@pytest.fixture
-def edge():
-    e = FakeEdge()
-    yield e
-    e.close()
-
-
 class SeamUdpTransport(UdpTransport):
-    """The real transport plus one test-only door: deliver a verdict as if the edge sent it."""
+    """The real transport plus two test-only doors: once ``open()`` has bound the state
+    socket it tells the fake edge where (so the edge pushes there, and ``Robot.open`` finds
+    state when it starts waiting), and ``deliver_outcome`` hands in a verdict as if the
+    edge had sent one. Built to ``edge``: its command port, and state port 0."""
+
+    def __init__(self, edge: FakeEdge, host: str = "127.0.0.1", **kw) -> None:
+        kw.setdefault("command_port", edge.command_port)
+        kw.setdefault("state_bind", ("127.0.0.1", 0))
+        super().__init__(host, **kw)
+        self._edge = edge
+
+    def open(self) -> None:
+        super().open()
+        assert self._sock is not None
+        self._edge.push_to(self._sock.getsockname())
 
     def deliver_outcome(self, outcome: Applied | Refused) -> None:
         for cb in tuple(self._on_outcome):
             cb(outcome)
 
 
+class SeamHybridTransport(HybridTransport):
+    """``HybridTransport`` whose UDP half reports its bound state port to the fake edge."""
+
+    def __init__(self, edge: FakeEdge, host: str = "127.0.0.1", **kw) -> None:
+        kw.setdefault("command_port", edge.command_port)
+        kw.setdefault("state_bind", ("127.0.0.1", 0))
+        kw.setdefault("livekit_url", "ws://fake")
+        kw.setdefault("room", "asimov-room")
+        kw.setdefault("token", "test-token")
+        super().__init__(host, **kw)
+        self._edge = edge
+
+    def open(self) -> None:
+        super().open()
+        assert self._udp._sock is not None
+        self._edge.push_to(self._udp._sock.getsockname())
+
+
+def route_udp_to(edge: FakeEdge, monkeypatch) -> None:
+    """Every ``udp`` and ``hybrid`` lane a :class:`ConnectionConfig` builds is the seam
+    transport over ``edge``: the config's ports still apply (tests name the edge's command
+    port and state port 0), and the edge learns the state port once it is bound."""
+    from menlo.asimov import connection
+
+    monkeypatch.setattr(
+        connection, "UdpTransport", lambda host, **kw: SeamUdpTransport(edge, host, **kw)
+    )
+    monkeypatch.setattr(
+        connection, "HybridTransport", lambda host, **kw: SeamHybridTransport(edge, host, **kw)
+    )
+
+
+@pytest.fixture
+def edge(monkeypatch):
+    e = FakeEdge()
+    route_udp_to(e, monkeypatch)
+    yield e
+    e.close()
+
+
 @pytest.fixture
 def robot(edge):
-    tx = SeamUdpTransport(
-        "127.0.0.1",
-        command_port=edge.command_port,
-        state_bind=("127.0.0.1", edge.state_port),
-        version_port=edge.version.port,
-    )
-    r = Robot(tx)
+    r = Robot(SeamUdpTransport(edge, version_port=edge.version.port))
     r.open(timeout=3.0)
     yield r
     r.close()
@@ -370,7 +422,8 @@ class FakeLiveKitClient:
         self._video_cbs: list = []
         self._audio_cbs: list = []
         self._track_cbs: list = []
-        self._sock: socket.socket | None = None
+        self._sock: socket.socket | None = None  # the state track: bound to port 0, kept
+        self._out: socket.socket | None = None  # commands leave from here: bound to port 0, kept
         self._reader: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -378,11 +431,14 @@ class FakeLiveKitClient:
     def connect(self) -> None:
         if self.connected:
             raise RuntimeError("already connected")
+        self._out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._out.bind(("127.0.0.1", 0))
         if self._carry_state:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.bind(("127.0.0.1", self._edge.state_port))
+            sock.bind(("127.0.0.1", 0))
             sock.settimeout(0.1)
             self._sock = sock
+            self._edge.push_to(sock.getsockname())  # the edge pushes here from now on
             self._stop.clear()
             self._reader = threading.Thread(target=self._read, daemon=True)
             self._reader.start()
@@ -398,6 +454,9 @@ class FakeLiveKitClient:
         if self._sock is not None:
             self._sock.close()
             self._sock = None
+        if self._out is not None:
+            self._out.close()
+            self._out = None
         self.connected = False
         self.identity = None
         self._local_tracks.clear()
@@ -410,9 +469,7 @@ class FakeLiveKitClient:
         if not self.connected:
             raise LinkLostError("the fake room is not joined")
         self.published.append((topic, payload))
-        out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        out.sendto(payload, ("127.0.0.1", self._edge.command_port))
-        out.close()
+        self._send(payload)
 
     def push_data_frame(self, name: str, payload: bytes) -> bool:
         if not self.connected:
@@ -422,9 +479,7 @@ class FakeLiveKitClient:
                 self._local_tracks.add(name)
             return False
         self.frames.append((name, payload))
-        out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        out.sendto(payload, ("127.0.0.1", self._edge.command_port))
-        out.close()
+        self._send(payload)
         return True
 
     def publisher_attributes(self, track: str) -> dict[str, str]:
@@ -467,6 +522,10 @@ class FakeLiveKitClient:
         self._track_cbs.append(callback)
 
     # ── plumbing + test helpers ──────────────────────────────────────────────
+    def _send(self, payload: bytes) -> None:
+        assert self._out is not None
+        self._out.sendto(payload, ("127.0.0.1", self._edge.command_port))
+
     def _read(self) -> None:
         while not self._stop.is_set():
             sock = self._sock
@@ -516,16 +575,7 @@ def make_livekit_robot(edge: FakeEdge, **kw) -> tuple[FakeLiveKitClient, Robot]:
 def make_hybrid_robot(edge: FakeEdge, **kw) -> tuple[FakeLiveKitClient, Robot]:
     """Mode A: UDP control, (faked) room media."""
     client = FakeLiveKitClient(edge, carry_state=False, **kw)
-    tx = HybridTransport(
-        "127.0.0.1",
-        livekit_url="ws://fake",
-        room="asimov-room",
-        token="test-token",
-        command_port=edge.command_port,
-        state_bind=("127.0.0.1", edge.state_port),
-        version_port=edge.version.port,
-        client=client,
-    )
+    tx = SeamHybridTransport(edge, version_port=edge.version.port, client=client)
     return client, Robot(tx)
 
 
@@ -550,13 +600,7 @@ def any_robot(request, edge):
     """The same robot over each of the three lanes. A behaviour that is not mode-agnostic
     is not done: every promise below is asserted three times."""
     if request.param == "udp":
-        tx = SeamUdpTransport(
-            "127.0.0.1",
-            command_port=edge.command_port,
-            state_bind=("127.0.0.1", edge.state_port),
-            version_port=edge.version.port,
-        )
-        r: Robot = Robot(tx)
+        r: Robot = Robot(SeamUdpTransport(edge, version_port=edge.version.port))
     else:
         maker = make_hybrid_robot if request.param == "hybrid" else make_livekit_robot
         _client, r = maker(edge)
@@ -657,6 +701,65 @@ def _own_environment(monkeypatch, tmp_path):
     for name in tuple(os.environ):
         if name.startswith("MENLO_") and name not in ("MENLO_HOME",) and "SDK_" not in name:
             monkeypatch.delenv(name, raising=False)
+
+
+def run_script_over(
+    edge: FakeEdge, body: str, stderr_file: Path, *, timeout: float = 30.0
+) -> tuple[int, str, str]:
+    """Run ``body`` in a child interpreter connected to ``edge`` on ``udp``, as ``robot``,
+    once the robot has reported; its return code, stdout and stderr.
+
+    The child binds its state socket to port 0 and prints the port it got, and the edge
+    pushes there from then on: no port is reserved and released. The child then waits for
+    the first state, as a ``connect`` that requires state would. Its stderr goes to
+    ``stderr_file``, never to a pipe nobody drains, and the wait for the port line is
+    bounded by ``timeout``: a child that exits first, or says nothing in time, fails the
+    test with its stderr."""
+    import select
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        f"""
+        from menlo.asimov import ConnectionConfig, Robot, UdpConfig
+
+        udp = UdpConfig(
+            "127.0.0.1",
+            version_port={edge.version.port}, command_port={edge.command_port},
+            state_bind=("127.0.0.1", 0),
+        )
+        robot = Robot(ConnectionConfig(udp=udp)).connect("udp", timeout=3.0, require_state=False)
+        print("state port", robot._transport._sock.getsockname()[1], flush=True)
+        robot.wait_until(lambda s: True, timeout=5.0)
+        """
+    ) + textwrap.dedent(body)
+    deadline = time.monotonic() + timeout
+    line, out = "", ""
+    with stderr_file.open("w") as err_out:
+        child = subprocess.Popen(
+            [sys.executable, "-c", script], stdout=subprocess.PIPE, stderr=err_out, text=True
+        )
+    try:
+        assert child.stdout is not None
+        while child.poll() is None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            ready, _, _ = select.select([child.stdout], [], [], left)
+            if ready:
+                line = child.stdout.readline()
+                break
+        if line.startswith("state port "):
+            edge.push_to(("127.0.0.1", int(line.split()[-1])))
+            out, _ = child.communicate(timeout=max(0.0, deadline - time.monotonic()))
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.communicate()
+    err = stderr_file.read_text()
+    assert line.startswith("state port "), f"the child never reported its state port:\n{err}"
+    return child.returncode, out, err
 
 
 @pytest.fixture

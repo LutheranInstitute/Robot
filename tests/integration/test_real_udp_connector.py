@@ -3,13 +3,16 @@
 The fake edge in conftest is shaped like the connector; this proves the shape. It needs
 Asimov Edge's source on the path (``ASIMOV_EDGE_SRC``), so it is marked ``integration``
 and skips (loudly, by name) when that is missing.
+
+No port is reserved and released: the connector binds its command socket to port 0 and
+the SDK its state socket to port 0, and each learns the other's port once it is bound
+(the connector's ``state_address`` is read on every state it forwards).
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-import socket
 import sys
 import time
 
@@ -26,40 +29,46 @@ if not EDGE_SRC:
 sys.path.insert(0, EDGE_SRC)
 
 
-def _free_port() -> int:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
+def _connector(topics):
+    from edge.connectors.udp_connector import UdpConnector
+
+    return UdpConnector(
+        topics,
+        command_host="127.0.0.1",
+        command_port=0,
+        state_host="127.0.0.1",
+        state_port=0,
+    )
+
+
+def _transport_to(conn, version_port: int) -> UdpTransport:
+    """A transport to the started connector; once open, the connector pushes state to it."""
+    assert conn._socket is not None, "the connector is started"
+    command_port = conn._socket.getsockname()[1]
+    tx = UdpTransport(
+        "127.0.0.1",
+        command_port=command_port,
+        state_bind=("127.0.0.1", 0),
+        version_port=version_port,
+    )
+    tx.open()
+    assert tx._sock is not None
+    conn.state_address = tx._sock.getsockname()
+    return tx
 
 
 def test_the_edge_admits_our_velocity_as_a_udp_source(version_endpoint):
-    from edge.connectors.udp_connector import UdpConnector
     from edge.control_source import ControlSource
     from edge.topic_registry import TopicRegistry
     from edge.topics import ROBOT_COMMAND_TOPIC
 
-    cmd_port, state_port = _free_port(), _free_port()
     topics = TopicRegistry()
     sub = topics.subscribe(ROBOT_COMMAND_TOPIC)
-    conn = UdpConnector(
-        topics,
-        command_host="127.0.0.1",
-        command_port=cmd_port,
-        state_host="127.0.0.1",
-        state_port=state_port,
-    )
+    conn = _connector(topics)
 
     async def main():
         await conn.start()
-        tx = UdpTransport(
-            "127.0.0.1",
-            command_port=cmd_port,
-            state_bind=("127.0.0.1", state_port),
-            version_port=version_endpoint.port,
-        )
-        tx.open()
+        tx = _transport_to(conn, version_endpoint.port)
         seq = tx.send(Velocity(vx=0.42))
         got = None
         for _ in range(100):
@@ -84,32 +93,18 @@ def test_the_edge_forwards_robot_state_to_our_bound_port(version_endpoint):
     from menlo.asimov._proto import load
 
     st_pb = load().state
-    from edge.connectors.udp_connector import UdpConnector
     from edge.messages import RobotStateMessage
     from edge.topic_registry import TopicRegistry
     from edge.topics import ROBOT_STATE_TOPIC
 
-    cmd_port, state_port = _free_port(), _free_port()
     topics = TopicRegistry()
-    conn = UdpConnector(
-        topics,
-        command_host="127.0.0.1",
-        command_port=cmd_port,
-        state_host="127.0.0.1",
-        state_port=state_port,
-    )
+    conn = _connector(topics)
     seen = []
 
     async def main():
         await conn.start()
-        tx = UdpTransport(
-            "127.0.0.1",
-            command_port=cmd_port,
-            state_bind=("127.0.0.1", state_port),
-            version_port=version_endpoint.port,
-        )
+        tx = _transport_to(conn, version_endpoint.port)
         tx.subscribe_state(seen.append)
-        tx.open()
         msg = st_pb.RobotState(current_mode=1, protocol_version=1)
         msg.joint_pos.extend([0.5] * 25)
         topics.publish(ROBOT_STATE_TOPIC, RobotStateMessage(msg))

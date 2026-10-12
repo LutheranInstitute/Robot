@@ -14,14 +14,17 @@ import time
 
 import pytest
 
-from menlo.asimov import Mode, Unknown
-from tests.conftest import connect_udp
+from menlo.asimov import ConnectionConfig, Mode, Robot, UdpConfig, Unknown
 
 pytestmark = pytest.mark.live
 
 
 def test_stand_walk_stop_damp(live_host):
-    with connect_udp(live_host, timeout=5.0) as robot:
+    # The SDK's own UDP defaults: a real Asimov Edge pushes state to the fixed state
+    # port, so this must not share conftest's helper, which serves the fake edge and
+    # binds the state socket to port 0.
+    cfg = ConnectionConfig(udp=UdpConfig(live_host))
+    with Robot(cfg).connect("udp", timeout=5.0) as robot:
         print(robot.info)
         assert robot.info.dof == 25
         assert robot.get_state().age_s < 0.5, "state should be streaming"

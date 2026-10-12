@@ -27,15 +27,13 @@ from menlo.asimov import (
     _version,
 )
 from menlo.cli import _common, _drive, _robots, build_parser, main
-from tests.conftest import FakeEdge, route_manager_rooms_to
+from tests.conftest import FakeEdge, route_manager_rooms_to, route_udp_to
 
 CRED = "eyJpZCI6ImEwY2QxNmRiIn0.secret"
 
 
 def _udp(edge: FakeEdge) -> UdpConfig:
-    return UdpConfig(
-        "127.0.0.1", command_port=edge.command_port, state_bind=("127.0.0.1", edge.state_port)
-    )
+    return UdpConfig("127.0.0.1", command_port=edge.command_port, state_bind=("127.0.0.1", 0))
 
 
 @pytest.fixture
@@ -52,8 +50,9 @@ def at_edge(monkeypatch):
 
 
 @pytest.fixture
-def fw_edge():
+def fw_edge(monkeypatch):
     e = FakeEdge(firmware=True, state_hz=200.0)
+    route_udp_to(e, monkeypatch)
     yield e
     e.close()
 

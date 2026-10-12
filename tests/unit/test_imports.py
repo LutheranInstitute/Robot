@@ -5,27 +5,26 @@ from __future__ import annotations
 import subprocess
 import sys
 
-from tests.conftest import FakeEdge
+from tests.conftest import run_script_over
 
 
-def test_importing_the_sdk_and_driving_over_udp_loads_no_livekit_and_no_cli_libraries(edge):
+def test_importing_the_sdk_and_driving_over_udp_loads_no_livekit_and_no_cli_libraries(
+    edge, tmp_path
+):
     """A real loopback LAN connect and preflight keep media and CLI imports lazy."""
-    edge: FakeEdge
-    script = f"""
-import sys
-from menlo.asimov import ConnectionConfig, Robot, UdpConfig
-cfg = ConnectionConfig(udp=UdpConfig(
-    "127.0.0.1", version_port={edge.version.port}, command_port={edge.command_port},
-    state_bind=("127.0.0.1", {edge.state_port})))
-with Robot(cfg).connect("udp", timeout=3.0) as robot:
-    robot.get_state()
-loaded = sorted(m for m in ("livekit", "questionary", "rich") if m in sys.modules)
-print(",".join(loaded))
-"""
-    out = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True, timeout=30, check=True
+    code, out, err = run_script_over(
+        edge,
+        """
+        import sys
+        robot.get_state()
+        robot.close()
+        loaded = sorted(m for m in ("livekit", "questionary", "rich") if m in sys.modules)
+        print("loaded", ",".join(loaded))
+        """,
+        tmp_path / "child.err",
     )
-    assert out.stdout.strip() == "", f"loaded: {out.stdout.strip()}"
+    assert code == 0, err
+    assert out.strip().endswith("loaded"), f"loaded: {out.strip()}"
 
 
 def test_the_cli_entry_point_imports_without_its_ui_libraries():

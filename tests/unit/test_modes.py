@@ -144,7 +144,7 @@ def test_link_loss_says_a_zero_went_out_only_when_one_did(edge, robot):
     idle = connect_udp(
         "127.0.0.1",
         command_port=edge.command_port,
-        state_bind=("127.0.0.1", edge.state_port),
+        state_bind=("127.0.0.1", 0),
         link_timeout=0.4,
     )
     try:
