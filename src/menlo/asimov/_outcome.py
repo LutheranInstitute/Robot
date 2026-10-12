@@ -20,9 +20,9 @@ from __future__ import annotations
 import dataclasses
 import enum
 import threading
-import time
 from dataclasses import dataclass
 
+from menlo.asimov import _clock
 from menlo.asimov._command import Command
 from menlo.asimov._errors import CommandRefusedError, OutcomeUnknownError
 
@@ -131,7 +131,7 @@ class Sent:
         self.sequence = sequence
         self.command = command
         self.clamped = clamped
-        self.sent_at = time.monotonic()
+        self.sent_at = _clock.monotonic()
         self.default_timeout = default_timeout
         self._outcome: Applied | Refused | None = None
         self._event = threading.Event()
@@ -164,7 +164,7 @@ class Sent:
         the caller decides whether it matters.
         """
         t = self.default_timeout if timeout is None else timeout
-        if self._event.wait(t) and self._outcome is not None:
+        if _clock.wait(self._event, t) and self._outcome is not None:
             return self._outcome
         return Unknown(self.sequence, waited_s=t, verb=self._name)
 

@@ -1,4 +1,9 @@
-"""Target policy at production connect, with HTTP confined to a loopback robot."""
+"""Target policy at production connect, with HTTP confined to a loopback robot.
+
+The preflight is HTTP inside ``UdpTransport.open()``, so these tests run the real transport
+over real loopback sockets on the real clock (``loopback_edge``); the one pure-LiveKit test
+runs on the in-memory edge.
+"""
 
 from __future__ import annotations
 
@@ -15,25 +20,26 @@ from menlo.asimov import (
     UdpConfig,
     _version,
 )
-from tests.conftest import SeamUdpTransport
+from tests.conftest import loopback_transport
 
 
 @pytest.fixture
-def target_robot(edge, monkeypatch, version_document_fetch):
+def target_robot(loopback_edge, monkeypatch, version_document_fetch):
     """Restore real HTTP only for this local endpoint; retain the production connect path."""
     monkeypatch.setattr(_version, "_fetch_version_document", version_document_fetch)
     cfg = ConnectionConfig(
         udp=UdpConfig(
             "127.0.0.1",
-            command_port=edge.command_port,
+            command_port=loopback_edge.command_port,
             state_bind=("127.0.0.1", 0),
-            version_port=edge.version.port,
+            version_port=loopback_edge.version.port,
             version_timeout=0.15,
         ),
         livekit=LiveKitConfig("ws://unused", "robot-test", "t"),
     )
     robot = Robot(cfg)
-    yield robot, edge.version
+    loopback_edge.follow_robot(robot)  # state goes to whatever port each connect() binds
+    yield robot, loopback_edge.version
     robot.close()
 
 
@@ -238,12 +244,13 @@ def test_pure_livekit_uses_native_rpc_without_querying_lan(edge, monkeypatch):
 
 
 def test_transport_bound_udp_checks_target_before_opening_socket(
-    edge, monkeypatch, version_document_fetch
+    loopback_edge, monkeypatch, version_document_fetch
 ):
     """Robot(UdpTransport(...)) cannot bypass the HTTP target check."""
+    edge = loopback_edge
     monkeypatch.setattr(_version, "_fetch_version_document", version_document_fetch)
     edge.version.body = b'{"robot_model":"future_robot","robot_os_version":"9.8.7"}'
-    tx = SeamUdpTransport(edge, version_port=edge.version.port)
+    tx = loopback_transport(edge, version_port=edge.version.port)
     robot = Robot(tx)
     with pytest.raises(CompatibilityError, match="unsupported robot target"):
         robot.open(require_state=False)
@@ -264,12 +271,12 @@ def test_version_timeout_must_be_finite_positive(timeout):
         UdpConfig("localhost", version_timeout=timeout)
 
 
-def test_target_success_does_not_waive_protocol_mismatch(target_robot, edge):
+def test_target_success_does_not_waive_protocol_mismatch(target_robot, loopback_edge):
     """Supported HTTP facts cannot authorize a mismatched first-state wire protocol."""
     from menlo.asimov import ProtocolMismatchError
 
     robot, endpoint = target_robot
-    edge.state.protocol_version = 99
+    loopback_edge.state.protocol_version = 99
     with pytest.raises(ProtocolMismatchError):
         robot.connect("udp", timeout=1.0)
     assert endpoint.requests == ["/api/version"]
@@ -358,14 +365,14 @@ def test_wire_skew_cannot_bypass_target_policy(target_robot, model, version):
 
 
 @pytest.mark.parametrize("target_override", [False, True])
-def test_target_override_does_not_waive_wire_mismatch(target_robot, edge, target_override):
+def test_target_override_does_not_waive_wire_mismatch(target_robot, loopback_edge, target_override):
     """Unsupported but valid HTTP facts pass the target override, then fail wire admission."""
     from menlo.asimov import ProtocolMismatchError
 
     robot, endpoint = target_robot
     if target_override:
         endpoint.body = b'{"robot_model":"future_robot","robot_os_version":"9.8.7"}'
-    edge.state.protocol_version = 99
+    loopback_edge.state.protocol_version = 99
     with pytest.raises(ProtocolMismatchError):
         robot.connect(
             "udp", allow_unsupported_target=target_override, allow_version_skew=False, timeout=1.0

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import re
 import threading
-import time
 from collections.abc import Iterator
 
 import pytest
@@ -13,7 +12,6 @@ import pytest
 from menlo.asimov import (
     ConnectError,
     ConnectionConfig,
-    LinkLostError,
     LiveKitConfig,
     ManagerConfig,
     NotConnectedError,
@@ -26,7 +24,8 @@ from menlo.asimov.transport import HybridTransport, LiveKitTransport, UdpTranspo
 from tests.conftest import (
     FakeLiveKitClient,
     FakeManager,
-    SeamHybridTransport,
+    MemoryTransport,
+    hybrid_transport,
     route_manager_rooms_to,
 )
 
@@ -224,19 +223,11 @@ def test_secrets_stay_out_of_repr():
 
 
 class _FakeLanes(ConnectionConfig):
-    """Real UDP to the FakeEdge; the LiveKit lane through the unit suite's fake room."""
+    """The UDP lane in memory to the FakeEdge; the LiveKit lane through the unit suite's
+    fake room."""
 
     def __init__(self, edge) -> None:
-        object.__setattr__(
-            self,
-            "udp",
-            UdpConfig(
-                "127.0.0.1",
-                command_port=edge.command_port,
-                state_bind=("127.0.0.1", 0),
-                version_port=edge.version.port,
-            ),
-        )
+        object.__setattr__(self, "udp", UdpConfig("127.0.0.1"))
         object.__setattr__(
             self, "livekit", LiveKitConfig(url="ws://fake", room="asimov-room", token="t")
         )
@@ -253,7 +244,7 @@ class _FakeLanes(ConnectionConfig):
         allow_unsupported_target=False,
     ):
         if mode == "udp":
-            return super().transport_for("udp")
+            return MemoryTransport(self._edge)
         client = FakeLiveKitClient(self._edge, carry_state=(mode == "livekit"))
         self.clients.append(client)
         if mode == "livekit":
@@ -265,14 +256,7 @@ class _FakeLanes(ConnectionConfig):
                 allow_unsupported_target=allow_unsupported_target,
                 client=client,
             )
-        return SeamHybridTransport(
-            self._edge,
-            livekit_url="ws://fake",
-            room="asimov-room",
-            token="t",
-            version_port=self._edge.version.port,
-            client=client,
-        )
+        return hybrid_transport(self._edge, client)
 
 
 def test_a_bound_robot_touches_nothing_until_connect(edge):
@@ -358,37 +342,6 @@ def test_a_lane_this_robot_left_cannot_write_into_the_next_session(edge):
         robot.close()
 
 
-def _keepalive_threads() -> list[threading.Thread]:
-    return [t for t in threading.enumerate() if t.name == "menlo-sdk-keepalive"]
-
-
-def test_reconnecting_from_on_link_lost_leaves_exactly_one_keepalive(edge):
-    """close()+connect() inside on_link_lost runs ON the keepalive thread. The old thread
-    must exit; a second one re-sending into the edge would double the command rate."""
-    before = len(_keepalive_threads())
-    robot = Robot(_FakeLanes(edge))
-    reconnected = threading.Event()
-
-    def reconnect(exc: LinkLostError) -> None:
-        robot.link_timeout = 2.0  # back to normal before the new session starts
-        robot.close()
-        robot.connect("udp", timeout=3.0)
-        reconnected.set()
-
-    robot.on_link_lost = reconnect
-    robot.connect("udp", timeout=3.0)
-    try:
-        robot.link_timeout = 0.0  # the next keepalive tick declares the link lost
-        assert reconnected.wait(3.0)
-        time.sleep(0.3)  # long enough for a stale thread to take its next tick
-        assert len(_keepalive_threads()) == before + 1
-        assert robot.connected
-    finally:
-        robot.close()
-    time.sleep(0.3)
-    assert len(_keepalive_threads()) == before
-
-
 def test_a_frames_generator_held_across_a_reconnect_follows_the_new_lane(edge):
     cfg = _FakeLanes(edge)
     robot = Robot(cfg).connect("livekit", timeout=3.0)
@@ -436,9 +389,7 @@ def test_connect_while_connected_raises_and_leaves_the_session_alone(edge):
 
 
 def test_a_mode_the_config_cannot_carry_fails_before_the_network(edge):
-    cfg = ConnectionConfig(
-        udp=UdpConfig("127.0.0.1", command_port=edge.command_port, state_bind=("127.0.0.1", 0))
-    )
+    cfg = ConnectionConfig(udp=UdpConfig("127.0.0.1"))
     robot = Robot(cfg)
     with pytest.raises(ConnectError, match="needs the livekit slot"):
         robot.connect("livekit")
@@ -465,4 +416,3 @@ def test_manager_config_end_to_end_reaches_the_fake_room(edge, manager, monkeypa
         assert manager.requests[-1][0]["Authorization"] == "Bearer cred"
     finally:
         robot.close()
-    time.sleep(0.05)

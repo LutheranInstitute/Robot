@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import enum
 import math
-import time
 from dataclasses import dataclass, field
 from typing import Literal
 
+from menlo.asimov import _clock
 from menlo.asimov._command import Limits
 
 #: A transport names its wire. A Literal, so a check against a name that no longer exists
@@ -173,7 +173,7 @@ class State:
     fw_timestamp_us: int
     protocol_version: int
     battery: Battery | None = None  # None when the robot has no BMS or did not report one
-    received_at: float = field(default_factory=time.monotonic)
+    received_at: float = field(default_factory=_clock.monotonic)
     # Asimov Edge's wall clock (µs since the epoch) when this sample arrived from the firmware.
     # Only the livekit connection mode carries it (as the data-track frame's user_timestamp);
     # 0 on udp and hybrid.
@@ -182,7 +182,7 @@ class State:
     @property
     def age_s(self) -> float:
         """Seconds since this sample arrived. A wait treats a large value as absence."""
-        return time.monotonic() - self.received_at
+        return _clock.monotonic() - self.received_at
 
     @property
     def euler(self) -> tuple[float, float, float] | None:

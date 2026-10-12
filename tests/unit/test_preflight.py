@@ -4,6 +4,10 @@ command runs before it sends (live state).
 The fake edge runs with ``firmware=True`` here, so its robot mode follows the commands the
 way the firmware does, including the MOVE gate: a velocity is held in STAND until STAND
 has been upright for 0.5 s.
+
+The tests against the fake firmware run on the virtual clock. The checks on one sample
+(``evaluate``, the arming tracker) start no edge and install no clock, so their samples
+are stamped with ``time.monotonic()``, the SDK's clock when no other is installed.
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ from menlo.asimov import (
     WaitTimeoutError,
 )
 from menlo.asimov._preflight import evaluate
-from tests.conftest import FakeEdge, connect_udp, put_in, route_udp_to
+from tests.conftest import FakeEdge, connect_udp, put_in
 
 
 def _state(
@@ -171,23 +175,6 @@ def test_problem_reads_well():
 # ── against the fake firmware ────────────────────────────────────────────────
 
 
-@pytest.fixture
-def fw_edge(monkeypatch):
-    e = FakeEdge(firmware=True, state_hz=200.0)
-    route_udp_to(e, monkeypatch)
-    yield e
-    e.close()
-
-
-def _robot(edge: FakeEdge):
-    return connect_udp(
-        "127.0.0.1",
-        command_port=edge.command_port,
-        state_bind=("127.0.0.1", 0),
-        timeout=3.0,
-    )
-
-
 def _no_motion(edge: FakeEdge) -> bool:
     """Nothing that would move the robot reached it: no STAND, velocity or trajectory."""
     return not any(
@@ -195,18 +182,18 @@ def _no_motion(edge: FakeEdge) -> bool:
     )
 
 
-def test_stand_returns_once_the_robot_is_armed(fw_edge):
-    with _robot(fw_edge) as robot:
+def test_stand_returns_once_the_robot_is_armed(clock, fw_edge):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         assert robot.preflight("stand").ok and robot.armed is False
-        started = time.monotonic()
+        started = clock.monotonic()
         robot.stand()
-        assert time.monotonic() - started >= 0.45, "STAND is reported at once; arming is not"
+        assert clock.monotonic() - started >= 0.45, "STAND is reported at once; arming is not"
         assert robot.get_state().mode is Mode.STAND and robot.armed is True
         assert fw_edge.armed, "the SDK must not call the robot armed before the firmware is"
 
-        sent_at = time.monotonic()
+        sent_at = clock.monotonic()
         robot.balance()
-        assert time.monotonic() - sent_at < 0.2, "no waiting for arming: armed already"
+        assert clock.monotonic() - sent_at < 0.2, "no waiting for arming: armed already"
         assert robot.get_state().mode is Mode.MOVE, "balance() returns once MOVE is reported"
         assert fw_edge.move_entered_at is not None
         assert fw_edge.move_entered_at - sent_at < 0.2, "the zero velocity enters MOVE"
@@ -217,7 +204,7 @@ def test_balance_right_after_a_stand_waits_for_the_stand_report_only(fw_edge):
     """balance() waits for the STAND it follows to be reported, then sends at once: it does
     not wait for arming. A zero velocity that arrives before the firmware arms leaves the
     robot in STAND, and the wait says so and what to do."""
-    with _robot(fw_edge) as robot:
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand(wait=False)  # returns before STAND is even reported
         with pytest.raises(WaitTimeoutError) as info:
             robot.balance(timeout=1.0)
@@ -231,7 +218,7 @@ def test_balance_right_after_a_stand_waits_for_the_stand_report_only(fw_edge):
 
 
 def test_balance_from_stand_without_wait_returns_once_sent(fw_edge):
-    with _robot(fw_edge) as robot:
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         sent = robot.balance(wait=False)
         assert sent.name == "balance" and sent.command.is_zero
@@ -239,13 +226,7 @@ def test_balance_from_stand_without_wait_returns_once_sent(fw_edge):
 
 
 def test_balance_that_never_reaches_move_times_out_naming_the_robot_mode(edge):
-    robot = connect_udp(
-        "127.0.0.1",
-        command_port=edge.command_port,
-        state_bind=("127.0.0.1", 0),
-        timeout=3.0,
-    )
-    with robot:
+    with connect_udp(edge, timeout=3.0) as robot:
         put_in(robot, edge, "stand")  # this fake robot stays in STAND whatever it is sent
         robot.wait_until(lambda s: robot.armed is True, timeout=2.0)
         with pytest.raises(WaitTimeoutError) as info:
@@ -256,15 +237,15 @@ def test_balance_that_never_reaches_move_times_out_naming_the_robot_mode(edge):
 
 
 @pytest.mark.parametrize("fault", [False, True])
-def test_balance_in_damp_is_sent_and_says_stand_first(fw_edge, fault):
-    with _robot(fw_edge) as robot:
+def test_balance_in_damp_is_sent_and_says_stand_first(clock, fw_edge, fault):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         if fault:
             fw_edge.fault(7)
-            time.sleep(0.1)
-        started = time.monotonic()
+            clock.sleep(0.1)
+        started = clock.monotonic()
         with pytest.raises(NotReadyError if fault else WaitTimeoutError) as info:
             robot.balance()
-        assert time.monotonic() - started < 0.3, "no wait from DAMP can succeed"
+        assert clock.monotonic() - started < 0.3, "no wait from DAMP can succeed"
         if fault:
             assert isinstance(info.value, RobotFaultedError) and "FALL_DETECTED" in str(info.value)
             assert info.value.has("faulted") and info.value.sent is not None
@@ -276,23 +257,25 @@ def test_balance_in_damp_is_sent_and_says_stand_first(fw_edge, fault):
         assert robot.get_state().mode is Mode.DAMP
 
 
-def test_balance_in_move_is_never_checked(fw_edge):
-    with _robot(fw_edge) as robot:
+def test_balance_in_move_is_never_checked(clock, fw_edge):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         robot.balance()
         fw_edge.pushing = False  # a stale stream does not hold it back
-        time.sleep(0.7)
+        clock.sleep(0.7)
         assert robot.preflight("move").has("stale_state")
         before = len(fw_edge.velocities())
-        started = time.monotonic()
+        started = clock.monotonic()
         robot.balance(timeout=5.0)
-        assert time.monotonic() - started < 0.1, "balance() in MOVE waits for nothing"
+        assert clock.monotonic() - started < 0.1, "balance() in MOVE waits for nothing"
         assert fw_edge.wait_for(lambda rx: len(fw_edge.velocities()) == before + 1)
         fw_edge.pushing = True
 
 
-def test_balance_from_another_thread_ends_a_hold_without_duration(fw_edge):
-    with _robot(fw_edge) as robot:
+def test_balance_from_another_thread_ends_a_hold_without_duration(clock, fw_edge):
+    """In MOVE, balance() sends at once and waits for nothing, on the clock or otherwise,
+    so a real thread can call it."""
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         robot.balance()
         robot.set_velocity(vx=0.2, wait=False)  # held at 10 Hz until the next command
@@ -300,16 +283,18 @@ def test_balance_from_another_thread_ends_a_hold_without_duration(fw_edge):
         other = threading.Thread(target=robot.balance)
         other.start()
         other.join(timeout=2.0)
-        ended = time.monotonic()
+        # By count, not time: the hold's first 0.2 and the zero leave at one clock instant.
+        ended = len(fw_edge.velocities())
         assert robot._latched is None
-        time.sleep(0.3)
-        assert set(fw_edge.velocities_between(ended)) <= {(0.0, 0.0, 0.0)}
+        clock.sleep(0.3)
+        assert fw_edge.velocities()[ended - 1] == (0.0, 0.0, 0.0), "the zero went out"
+        assert set(fw_edge.velocities()[ended:]) <= {(0.0, 0.0, 0.0)}
         assert fw_edge.velocities()[-1] == (0.0, 0.0, 0.0)
         assert robot.get_state().mode is Mode.MOVE
 
 
 def test_set_velocity_in_stand_is_sent_and_an_armed_robot_enters_move(fw_edge):
-    with _robot(fw_edge) as robot:
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         robot.set_velocity(vx=0.2, duration=0.3, timeout=5.0)
         assert (0.2, 0.0, 0.0) in fw_edge.velocities()
@@ -317,67 +302,67 @@ def test_set_velocity_in_stand_is_sent_and_an_armed_robot_enters_move(fw_edge):
         assert robot.get_state().mode is Mode.MOVE
 
 
-def test_set_velocity_waits_by_default_and_needs_a_duration(fw_edge):
-    with _robot(fw_edge) as robot:
+def test_set_velocity_waits_by_default_and_needs_a_duration(clock, fw_edge):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         robot.balance()
         before = len(fw_edge.received)
         with pytest.raises(ValueError, match="needs a duration= to wait for, or wait=False"):
             robot.set_velocity(vx=0.2)
-        time.sleep(0.1)
+        clock.sleep(0.1)
         assert len(fw_edge.received) == before, "a ValueError sends nothing"
-        started = time.monotonic()
+        started = clock.monotonic()
         robot.set_velocity(vx=0.2, duration=0.3)
-        assert time.monotonic() - started >= 0.3, "the default waits for the duration"
+        assert clock.monotonic() - started >= 0.3, "the default waits for the duration"
         assert fw_edge.wait_for(lambda rx: fw_edge.velocities()[-1] == (0.0, 0.0, 0.0))
 
 
-def test_set_velocity_hold_false_sends_one_packet_and_never_re_sends(fw_edge):
-    with _robot(fw_edge) as robot:
+def test_set_velocity_hold_false_sends_one_packet_and_never_re_sends(clock, fw_edge):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         robot.balance()
         before = len(fw_edge.velocities())
-        started = time.monotonic()
+        started = clock.monotonic()
         sent = robot.set_velocity(vx=0.6, hold=False)  # no duration, no wait: not a ValueError
-        assert time.monotonic() - started < 0.05, "a ready robot adds no delay"
+        assert clock.monotonic() - started < 0.05, "a ready robot adds no delay"
         assert sent.clamped and sent.command.vx == 0.4, "the limits still apply"
-        time.sleep(1.0)
+        clock.sleep(1.0)
         assert fw_edge.velocities()[before:] == [(0.4, 0.0, 0.0)], "one packet, no re-sends"
         robot.set_velocity(vx=0.1, hold=False, wait=False)  # an explicit wait=False is fine
         assert fw_edge.wait_for(lambda rx: fw_edge.velocities()[-1] == (0.1, 0.0, 0.0))
 
 
-def test_set_velocity_hold_false_ends_a_running_hold(fw_edge):
-    with _robot(fw_edge) as robot:
+def test_set_velocity_hold_false_ends_a_running_hold(clock, fw_edge):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         robot.balance()
         robot.set_velocity(vx=0.3, wait=False)  # held at 10 Hz
         assert fw_edge.wait_for(lambda rx: (0.3, 0.0, 0.0) in fw_edge.velocities())
         robot.set_velocity(vx=0.1, hold=False)
-        after = time.monotonic()
-        time.sleep(0.5)
+        after = clock.monotonic()
+        clock.sleep(0.5)
         assert fw_edge.velocities_between(after + 0.05) == [], "the old hold was re-sent"
         assert fw_edge.velocities()[-1] == (0.1, 0.0, 0.0)
 
 
-def test_set_velocity_hold_false_refuses_at_once_on_a_stale_stream(fw_edge):
-    with _robot(fw_edge) as robot:
+def test_set_velocity_hold_false_refuses_at_once_on_a_stale_stream(clock, fw_edge):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         robot.set_velocity(vx=0.05, hold=False)  # STAND: sent, the firmware decides
         assert fw_edge.wait_for(lambda rx: (0.05, 0.0, 0.0) in fw_edge.velocities())
         robot.balance()
         fw_edge.pushing = False
-        time.sleep(0.6)
-        started = time.monotonic()
+        clock.sleep(0.6)
+        started = clock.monotonic()
         with pytest.raises(NotReadyError) as info:
             robot.set_velocity(vx=0.1, hold=False)  # a loop must not stall on a stale stream
-        assert time.monotonic() - started < 0.1 and info.value.has("stale_state")
+        assert clock.monotonic() - started < 0.1 and info.value.has("stale_state")
         fw_edge.pushing = True
         assert (0.1, 0.0, 0.0) not in fw_edge.velocities()
 
 
-def test_set_velocity_hold_false_takes_no_duration_and_no_wait(fw_edge):
-    with _robot(fw_edge) as robot:
+def test_set_velocity_hold_false_takes_no_duration_and_no_wait(clock, fw_edge):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         robot.balance()
         before = len(fw_edge.received)
@@ -385,12 +370,12 @@ def test_set_velocity_hold_false_takes_no_duration_and_no_wait(fw_edge):
             robot.set_velocity(vx=0.1, hold=False, duration=1.0)
         with pytest.raises(ValueError, match="nothing to wait for"):
             robot.set_velocity(vx=0.1, hold=False, wait=True)
-        time.sleep(0.1)
+        clock.sleep(0.1)
         assert len(fw_edge.received) == before
 
 
 def test_close_zeroes_a_velocity_sent_with_hold_false(fw_edge):
-    robot = _robot(fw_edge)
+    robot = connect_udp(fw_edge, timeout=3.0)
     robot.stand()
     robot.balance()
     robot.set_velocity(vx=0.2, hold=False)
@@ -399,7 +384,7 @@ def test_close_zeroes_a_velocity_sent_with_hold_false(fw_edge):
 
 
 def test_move_to_stand_stays_armed(fw_edge):
-    with _robot(fw_edge) as robot:
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         robot.balance()
         fw_edge.set_mode("stand")  # an operator's STAND from MOVE
@@ -408,7 +393,7 @@ def test_move_to_stand_stays_armed(fw_edge):
 
 
 def test_stand_in_move_sends_stand(fw_edge):
-    with _robot(fw_edge) as robot:
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         robot.balance()
         stands = fw_edge.modes().count("stand")
@@ -418,30 +403,30 @@ def test_stand_in_move_sends_stand(fw_edge):
 
 
 @pytest.mark.parametrize("verb", ["set_velocity", "trajectory", "set_joints"])
-def test_in_damp_a_motion_command_is_sent_at_once(fw_edge, verb):
-    with _robot(fw_edge) as robot:
+def test_in_damp_a_motion_command_is_sent_at_once(clock, fw_edge, verb):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         pose = list(robot.get_state().joint_pos)
         call = {
             "set_velocity": lambda: robot.set_velocity(vx=0.2, timeout=5.0, wait=False),
             "trajectory": lambda: robot.trajectory(pose, timeout=5.0),
             "set_joints": lambda: robot.set_joints(pose, duration=0.2, wait=False),
         }[verb]
-        started = time.monotonic()
+        started = clock.monotonic()
         call()
-        assert time.monotonic() - started < 0.2
+        assert clock.monotonic() - started < 0.2
         assert fw_edge.wait_for(
             lambda rx: any(c.HasField("policy") or c.HasField("all_trajectory") for c in rx)
         ), "the command is sent: the firmware decides"
         robot.damp()
 
 
-def test_a_tilted_robot_never_arms(fw_edge):
+def test_a_tilted_robot_never_arms(clock, fw_edge):
     fw_edge.state.projected_gravity[:] = [0.0, 0.6, -0.8]
-    with _robot(fw_edge) as robot:
-        started = time.monotonic()
+    with connect_udp(fw_edge, timeout=3.0) as robot:
+        started = clock.monotonic()
         with pytest.raises(WaitTimeoutError) as timed_out:
             robot.stand(timeout=0.8)
-        assert time.monotonic() - started >= 0.75
+        assert clock.monotonic() - started >= 0.75
         assert "has not armed" in str(timed_out.value) and timed_out.value.sent is not None
         assert robot.get_state().mode is Mode.STAND
         check = robot.preflight("move")
@@ -455,11 +440,11 @@ def test_a_tilted_robot_never_arms(fw_edge):
 
 
 @pytest.mark.parametrize("verb", ["stand", "balance", "set_velocity", "trajectory", "set_joints"])
-def test_a_latched_fault_never_refuses_a_command(fw_edge, verb):
-    with _robot(fw_edge) as robot:
+def test_a_latched_fault_never_refuses_a_command(clock, fw_edge, verb):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         fw_edge.fault(7)
         robot.wait_until(lambda s: True, timeout=1.0)
-        time.sleep(0.05)
+        clock.sleep(0.05)
         pose = list(robot.get_state().joint_pos)
         before = len(fw_edge.received)
         call = {
@@ -476,59 +461,53 @@ def test_a_latched_fault_never_refuses_a_command(fw_edge, verb):
 
 
 @pytest.mark.parametrize("verb", ["stand", "balance"])
-def test_a_latched_fault_is_raised_by_the_wait_after_sending(fw_edge, verb):
-    with _robot(fw_edge) as robot:
+def test_a_latched_fault_is_raised_by_the_wait_after_sending(clock, fw_edge, verb):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         fw_edge.fault(7)
         robot.wait_until(lambda s: True, timeout=1.0)
-        time.sleep(0.05)
-        started = time.monotonic()
+        clock.sleep(0.05)
+        started = clock.monotonic()
         with pytest.raises(RobotFaultedError) as info:
             getattr(robot, verb)(timeout=5.0)
-        assert time.monotonic() - started < 0.5, "a latched fault does not clear by waiting"
+        assert clock.monotonic() - started < 0.5, "a latched fault does not clear by waiting"
         assert info.value.has("faulted") and "FALL_DETECTED" in str(info.value)
         assert "until the firmware restarts" in str(info.value)
         assert info.value.sent is not None and info.value.sent.name == verb
         assert info.value.state.faulted
 
 
-def test_a_fault_while_standing_is_raised_by_stand(fw_edge):
-    with _robot(fw_edge) as robot:
-        threading.Timer(0.15, fw_edge.fault, args=(7,)).start()  # before the 0.5 s arming
+def test_a_fault_while_standing_is_raised_by_stand(clock, fw_edge):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
+        clock.call_later(0.15, fw_edge.fault)  # FALL_DETECTED, before the 0.5 s arming
         with pytest.raises(RobotFaultedError) as info:
             robot.stand()
         assert info.value.sent is not None and info.value.sent.name == "stand"
         assert info.value.action == "stand" and "FALL_DETECTED" in str(info.value)
 
 
-def test_damp_is_never_checked(fw_edge):
-    with _robot(fw_edge) as robot:
+def test_damp_is_never_checked(clock, fw_edge):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         fw_edge.fault(7)
-        time.sleep(0.1)
+        clock.sleep(0.1)
         assert robot.preflight("move").has("faulted") and robot.preflight("stand").has("faulted")
         robot.damp()  # returns: no actuator of a fault-DAMPed robot holds a position
         assert fw_edge.wait_for(lambda rx: fw_edge.modes().count("damp") == 1)
 
         fw_edge.pushing = False  # and a stale stream does not hold it back either
-        time.sleep(0.7)
+        clock.sleep(0.7)
         robot.damp(wait=False)
         assert fw_edge.wait_for(lambda rx: fw_edge.modes().count("damp") == 2)
 
 
 def test_damp_returns_once_damp_is_reported(fw_edge):
-    with _robot(fw_edge) as robot:
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         robot.damp()
         assert robot.get_state().mode is Mode.DAMP and robot.armed is False
 
 
 def test_damp_that_is_not_reported_times_out_naming_the_robot_mode(edge):
-    robot = connect_udp(
-        "127.0.0.1",
-        command_port=edge.command_port,
-        state_bind=("127.0.0.1", 0),
-        timeout=3.0,
-    )
-    with robot:
+    with connect_udp(edge, timeout=3.0) as robot:
         put_in(robot, edge, "move")  # this fake robot ignores the DAMP
         with pytest.raises(WaitTimeoutError) as info:
             robot.damp(timeout=0.3)
@@ -536,62 +515,60 @@ def test_damp_that_is_not_reported_times_out_naming_the_robot_mode(edge):
         assert "still reports MOVE" in str(info.value) and "E-Stop" in str(info.value)
 
 
-def test_a_command_waits_out_a_stale_stream_that_recovers(fw_edge):
-    with _robot(fw_edge) as robot:
+def test_a_command_waits_out_a_stale_stream_that_recovers(clock, fw_edge):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         robot.balance()
         fw_edge.pushing = False
-        time.sleep(0.6)
+        clock.sleep(0.6)
         assert robot.preflight("move").has("stale_state")
-        threading.Timer(0.3, setattr, args=(fw_edge, "pushing", True)).start()
+        clock.call_later(0.3, lambda: setattr(fw_edge, "pushing", True))
         robot.set_velocity(vx=0.1, timeout=3.0, wait=False)
         assert fw_edge.wait_for(lambda rx: (0.1, 0.0, 0.0) in fw_edge.velocities())
         robot.balance()
 
 
-def test_a_ready_trajectory_check_adds_no_delay(fw_edge):
-    with _robot(fw_edge) as robot:
+def test_a_ready_trajectory_check_adds_no_delay(clock, fw_edge):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         pose = list(robot.get_state().joint_pos)
         robot.trajectory(pose)
         robot.wait_until(lambda s: s.mode is Mode.MOVE, timeout=1.0)
-        started = time.monotonic()
+        started = clock.monotonic()
         for _ in range(50):
             robot.trajectory(pose)
-        assert (time.monotonic() - started) / 50 < 0.005, "a 50 Hz loop must keep its rate"
+        assert (clock.monotonic() - started) / 50 < 0.005, "a 50 Hz loop must keep its rate"
         robot.damp()
 
 
-def test_a_streaming_trajectory_raises_at_once_on_a_stale_stream(fw_edge):
-    with _robot(fw_edge) as robot:
+def test_a_streaming_trajectory_raises_at_once_on_a_stale_stream(clock, fw_edge):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         pose = list(robot.get_state().joint_pos)
         robot.trajectory(pose)
         robot.wait_until(lambda s: s.mode is Mode.MOVE, timeout=1.0)
         fw_edge.pushing = False
-        time.sleep(0.6)
+        clock.sleep(0.6)
         sent_before = len(fw_edge.received)
-        started = time.monotonic()
+        started = clock.monotonic()
         with pytest.raises(NotReadyError) as info:
             robot.trajectory(pose)  # a 50 Hz loop must not stall on a stale stream
-        assert time.monotonic() - started < 0.1
+        assert clock.monotonic() - started < 0.1
         assert info.value.has("stale_state") and len(fw_edge.received) == sent_before
         fw_edge.pushing = True
 
 
-def test_fault_damp_is_a_latched_fault(fw_edge):
-    with _robot(fw_edge) as robot:
+def test_fault_damp_is_a_latched_fault(clock, fw_edge):
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand()
         robot.balance()
         robot.set_velocity(vx=0.2, wait=False)  # held at 10 Hz until something ends it
         fw_edge.fault_damp()
-        deadline = time.monotonic() + 1.0
-        while robot.get_state().mode is not Mode.FAULT_DAMP and time.monotonic() < deadline:
-            time.sleep(0.01)
+        clock.run_until(lambda: robot.get_state().mode is Mode.FAULT_DAMP, 1.0)
         s = robot.get_state()
         assert s.mode is Mode.FAULT_DAMP and s.faulted and s.error_flags == 0
         assert robot.armed is False
-        time.sleep(0.15)
+        clock.sleep(0.15)
         assert robot._latched is None, "FAULT_DAMP releases a held velocity"
         check = robot.preflight("move")
         assert check.has("faulted") and check.ok
@@ -619,7 +596,7 @@ def test_a_refusal_names_the_problem_and_its_fix():
 
 
 def test_a_closed_robot_is_not_connected(fw_edge):
-    robot = _robot(fw_edge)
+    robot = connect_udp(fw_edge, timeout=3.0)
     robot.close()
     check = robot.preflight()
     assert not check.ok and check.has("not_connected") and robot.armed is None
@@ -631,7 +608,7 @@ def test_a_closed_robot_is_not_connected(fw_edge):
 
 def test_without_gravity_stand_returns_at_stand_and_arming_is_unknown(fw_edge):
     del fw_edge.state.projected_gravity[:]
-    with _robot(fw_edge) as robot:
+    with connect_udp(fw_edge, timeout=3.0) as robot:
         robot.stand(timeout=2.0)
         assert robot.get_state().mode is Mode.STAND and robot.armed is None
         assert robot.preflight("move").problems == ()

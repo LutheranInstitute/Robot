@@ -33,11 +33,11 @@ from menlo.asimov import (
     UdpConfig,
     WaitTimeoutError,
 )
-from menlo.asimov._command import Velocity
+from menlo.asimov._command import ModeCommand, Trajectory, Velocity
 from menlo.asimov.transport import _livekit_client
 from menlo.asimov.transport._livekit_client import _LiveKitClient
 from menlo.asimov.transport.udp import state_from_robot_state
-from tests.conftest import SeamUdpTransport, put_in, route_manager_rooms_to
+from tests.conftest import MemoryTransport, put_in, route_manager_rooms_to
 
 CRED = "eyJpZCI6ImEwY2QxNmRiIn0.secret"
 
@@ -96,77 +96,74 @@ def _sample(edge, seq: int, mode: int, *, protocol: int | None = None):
     return state_from_robot_state(m, None)
 
 
-def test_a_fault_damp_releases_a_held_velocity(edge, robot):
+def test_a_fault_damp_releases_a_held_velocity(clock, edge, robot):
     put_in(robot, edge, "move")
     robot.set_velocity(vx=0.2, wait=False)  # unbounded: held at 10 Hz until something ends it
     assert edge.wait_for(lambda r: len(r) >= 3, 2.0), "the keepalive is re-sending"
     edge.set_mode("damp")  # another controller's DAMP, no fault
-    time.sleep(0.3)
+    clock.sleep(0.3)
     assert robot._latched is not None, "a plain DAMP report (no fault) does not end a drive"
     a = edge.state.active_alerts.add()
     a.id, a.severity = 7, 0  # CRITICAL; the mode is already DAMP: this is a fault-DAMP
-    deadline = time.monotonic() + 1.0
-    while robot._latched is not None and time.monotonic() < deadline:
-        time.sleep(0.02)
-    assert robot._latched is None, "the fault released the hold"
+    assert clock.run_until(lambda: robot._latched is None, 1.0), "the fault released the hold"
     n = len(edge.received)
-    time.sleep(0.35)
+    clock.sleep(0.35)
     assert len(edge.received) == n, "and nothing more went out, not even a zero"
     assert robot.connected and robot.get_state().faulted  # the session itself is still up
 
 
-def test_a_fault_damp_during_a_waited_walk_raises_rather_than_returns(edge, robot):
+def test_a_fault_damp_during_a_waited_walk_raises_rather_than_returns(clock, edge, robot):
     put_in(robot, edge, "move")
 
-    def fault_soon() -> None:
-        time.sleep(0.4)
+    def fault() -> None:
         edge.set_mode("damp")
         a = edge.state.active_alerts.add()
         a.id, a.severity = 7, 0  # FALL_DETECTED, CRITICAL: a fault-DAMP
 
-    threading.Thread(target=fault_soon, daemon=True).start()
-    started = time.monotonic()
+    clock.call_later(0.4, fault)
+    started = clock.monotonic()
     with pytest.raises(RobotFaultedError, match="FALL_DETECTED") as info:
         robot.set_velocity(vx=0.2, duration=5.0)  # wait=True: blocks for the walk
-    assert time.monotonic() - started < 2.0, "the fault ends the wait, not the duration"
+    assert clock.monotonic() - started < 2.0, "the fault ends the wait, not the duration"
     assert info.value.sent is not None and info.value.sent.command.vx == 0.2
     assert info.value.has("faulted")
     n = len(edge.received)
-    time.sleep(0.35)
+    clock.sleep(0.35)
     assert len(edge.received) == n, "nothing more went out after the fault"
 
 
-def test_balance_after_a_fault_damp_ends_a_raw_stream_sends_zero_and_raises_the_fault(edge, robot):
+def test_balance_after_a_fault_damp_ends_a_raw_stream_sends_zero_and_raises_the_fault(
+    clock, edge, robot
+):
     put_in(robot, edge, "move")
     robot.set_velocity(vx=0.2, hold=False)  # one raw packet: nothing is latched
     edge.set_mode("damp")
     a = edge.state.active_alerts.add()
     a.id, a.severity = 7, 0  # FALL_DETECTED, CRITICAL: a fault-DAMP
     assert edge.wait_for(lambda _: robot.get_state().faulted, 2.0)
-    time.sleep(0.1)
+    clock.sleep(0.1)
     with pytest.raises(RobotFaultedError) as info:
         robot.balance()
     assert info.value.sent is not None and info.value.sent.command == Velocity()
     assert edge.wait_for(lambda _: edge.velocities()[-1] == (0.0, 0.0, 0.0), 2.0)
 
 
-def test_damp_from_a_state_callback_sends_and_does_not_stall_the_state(edge, robot):
+def test_damp_from_a_state_callback_sends_and_does_not_stall_the_state(clock, edge, robot):
     """An alert callback sends DAMP without blocking the reader or later state frames."""
     put_in(robot, edge, "move")
     returned: list[float] = []
 
     def on_alert(alert, change) -> None:
         if change == "raised":
-            started = time.monotonic()
+            started = clock.monotonic()
             robot.damp()  # wait=True by default: in a callback it must not block
-            returned.append(time.monotonic() - started)
+            returned.append(clock.monotonic() - started)
 
     robot.on_alert = on_alert
     a = edge.state.active_alerts.add()
     a.id, a.severity = 3, 1  # a warning: nothing latches, the callback damps
     assert edge.wait_for(lambda _: bool(returned), 2.0)
     assert returned[0] < 0.5, "damp() in a callback returns once sent"
-    # UDP send completion does not mean the fake edge's receiver has consumed the packet.
     assert edge.wait_for(lambda _: "damp" in edge.modes(), 2.0)
     seq = robot.get_state().sequence
     robot.wait_until(lambda s: s.sequence > seq + 5, timeout=2.0)  # state kept flowing
@@ -197,9 +194,9 @@ def test_a_waiting_verb_in_a_state_callback_is_a_runtime_error_with_nothing_sent
     assert "stand" not in edge.modes()
 
 
-def test_a_firmware_restart_releases_a_held_velocity_and_fences_a_set_joints(edge, robot):
+def test_a_firmware_restart_releases_a_held_velocity_and_fences_a_set_joints(clock, edge, robot):
     edge.pushing = False
-    time.sleep(0.05)
+    clock.sleep(0.05)
     robot._on_state(_sample(edge, 5000, 2))
     robot.set_velocity(vx=0.3, wait=False)
     gen = robot._generation
@@ -212,14 +209,14 @@ def test_a_firmware_restart_releases_a_held_velocity_and_fences_a_set_joints(edg
     assert robot._generation > gen, "and a running set_joints / trajectory re-send is fenced off"
 
 
-def test_a_sample_arriving_while_open_is_still_running_is_handshaken(edge, monkeypatch):
+def test_a_sample_arriving_while_open_is_still_running_is_handshaken(clock, edge, monkeypatch):
     """LiveKit's open() waits for media for seconds; state that lands meanwhile must go
     through the late handshake, not be stored raw as `robot.get_state()`."""
     edge.pushing = False
-    time.sleep(0.05)
+    clock.sleep(0.05)
 
     def robot_over(protocol: int | None):
-        tx = SeamUdpTransport(edge)
+        tx = MemoryTransport(edge)
         r = Robot(tx)
         real_open = tx.open
 
@@ -287,6 +284,7 @@ class _FakeRtc:
 
 @pytest.fixture
 def lk_client(monkeypatch):
+    """Real clock: the client runs its asyncio loop on a thread of its own."""
     monkeypatch.setattr(_livekit_client, "_rtc", lambda: _FakeRtc)
     client = _LiveKitClient("ws://robot:7880", "robot-menlo-0042", token=lambda: "jwt")
     client.connect()
@@ -350,6 +348,9 @@ def _mem_sample(mode: Mode = Mode.MOVE, sequence: int = 10, **changes):
 
 
 class _MemoryTransport:
+    """Real clock: the tests over this transport run the SDK's real threads (the stall tests
+    need a thread named menlo-sdk-keepalive), so no virtual clock is installed here."""
+
     kind = "livekit"
     endpoint = "memory"
     capabilities = frozenset({"drive", "state", "camera", "microphone"})
@@ -399,6 +400,7 @@ class _MemoryTransport:
 
 @pytest.fixture
 def mem():
+    """Real clock, real keepalive thread: see ``_MemoryTransport``."""
     transport = _MemoryTransport()
     robot = Robot(transport)
     robot.open()
@@ -580,7 +582,7 @@ def test_a_stalled_recording_write_does_not_hold_up_the_stall_zero(mem):
 
 
 @pytest.mark.parametrize("hold", [True, False])
-def test_balance_that_refuses_after_a_velocity_leaves_close_its_zero(edge, robot, hold):
+def test_balance_that_refuses_after_a_velocity_leaves_close_its_zero(clock, edge, robot, hold):
     put_in(robot, edge, "move")
     if hold:
         robot.set_velocity(vx=0.3, wait=False)
@@ -589,7 +591,7 @@ def test_balance_that_refuses_after_a_velocity_leaves_close_its_zero(edge, robot
     edge.set_mode("damp")  # another controller's DAMP, no fault
     assert edge.wait_for(lambda _: robot.get_state().mode is Mode.DAMP, 2.0)
     edge.pushing = False  # and then no live state: the one refusal
-    time.sleep(0.7)
+    clock.sleep(0.7)
     n = len(edge.received)
     with pytest.raises(NotReadyError) as info:
         robot.balance(timeout=0.1)
@@ -653,7 +655,10 @@ def test_a_udp_reopen_from_a_state_callback_ends_the_old_reader(monkeypatch):
             self.bad_reads = 0
 
         def bind(self, address) -> None:
-            pass
+            self.address = address
+
+        def getsockname(self):  # open() records where the state socket is bound
+            return self.address
 
         def settimeout(self, timeout) -> None:
             pass
@@ -763,7 +768,9 @@ def test_a_verb_in_a_state_callback_while_recording_still_marks_the_callback(mem
 
 
 class _Silent(_MemoryTransport):
-    def open(self) -> None:  # the robot has not reported when the session opens
+    """Real clock, as ``_MemoryTransport``; the robot has not reported when the session opens."""
+
+    def open(self) -> None:
         pass
 
 
@@ -807,3 +814,94 @@ def test_a_checked_verb_on_an_ended_session_raises_its_own_error_at_once(mem, en
         robot.stand(wait=False, timeout=5.0)
     assert time.monotonic() - started < 1.0, "at once, not after the timeout"
     assert len(transport.commands) == n
+
+
+# ── real threads, synchronized by events: the races the virtual clock does not time ──
+
+
+def test_close_from_another_thread_ends_a_waited_hold_with_not_connected(mem):
+    """A real second thread: close() while another thread is blocked in a waited hold.
+    The hold's velocity has left (an event says so), then close() ends the wait with
+    NotConnectedError and sends the zero. Events and joins, never time."""
+    robot, transport = mem
+    sent = threading.Event()
+    transport.after_send = lambda command: sent.set() if not command.is_zero else None
+    outcome: list[BaseException] = []
+
+    def walk() -> None:
+        try:
+            robot.set_velocity(vx=0.2, duration=30.0)  # wait=True: blocked in the hold
+        except BaseException as exc:
+            outcome.append(exc)
+
+    walker = threading.Thread(target=walk)
+    walker.start()
+    assert sent.wait(5.0), "the velocity went out"
+    robot.close()
+    walker.join(5.0)
+    assert not walker.is_alive(), "close() released the waiting thread"
+    assert len(outcome) == 1 and isinstance(outcome[0], NotConnectedError), outcome
+    assert "closed before the hold ended" in str(outcome[0])
+    assert transport.commands[-1] == Velocity(), "close() zeroed the held velocity"
+
+
+def test_damp_from_another_thread_fences_a_set_joints_loop_on_its_own_thread(mem):
+    """A real set_joints thread is mid-motion (its third setpoint has left, an event says
+    so) when damp() lands from another thread: the loop's next tick sees the fence and
+    exits without sending, so no setpoint follows the DAMP. Events and joins, never time."""
+    robot, transport = mem
+    third = threading.Event()
+
+    def count(command) -> None:
+        if sum(isinstance(c, Trajectory) for c in transport.commands) >= 3:
+            third.set()
+
+    transport.after_send = count
+    robot.set_joints([0.1, 0.0, 0.0], duration=2.0, hz=50.0, wait=False)
+    assert third.wait(5.0), "the motion is in flight on its thread"
+    loop = next(t for t in threading.enumerate() if t.name == "menlo-sdk-set-joints")
+    robot.damp(wait=False)
+    loop.join(5.0)
+    assert not loop.is_alive(), "the fence ended the loop"
+    damp_at = max(i for i, c in enumerate(transport.commands) if isinstance(c, ModeCommand))
+    after = transport.commands[damp_at + 1 :]
+    assert not any(isinstance(c, Trajectory) for c in after), (
+        f"a setpoint left after the damp: {after}"
+    )
+
+
+def test_reconnecting_from_on_link_lost_leaves_exactly_one_keepalive_thread(monkeypatch):
+    """close()+connect() inside on_link_lost runs ON the keepalive thread: the old thread
+    must exit (joined here), and exactly one keepalive is left. Real threads, synchronized
+    by events and joins; the loss is the keepalive's own next tick, not a timed wait."""
+    made: list[_MemoryTransport] = []
+
+    def build(*_a, **_k) -> _MemoryTransport:
+        made.append(_MemoryTransport())
+        return made[-1]
+
+    monkeypatch.setattr(ConnectionConfig, "transport_for", build)
+    robot = Robot(ConnectionConfig(udp=UdpConfig("unused")))
+    reconnected = threading.Event()
+
+    def reconnect(_exc: LinkLostError) -> None:
+        robot.link_timeout = 2.0  # back to normal before the new session starts
+        robot.close()
+        robot.connect("udp", timeout=1.0, persist=False)
+        reconnected.set()
+
+    robot.on_link_lost = reconnect
+    before = {t for t in threading.enumerate() if t.name == "menlo-sdk-keepalive"}
+    robot.connect("udp", timeout=1.0, persist=False)
+    first = robot._keepalive
+    assert first is not None
+    try:
+        robot.link_timeout = 0.0  # the next keepalive tick declares the link lost
+        assert reconnected.wait(5.0), "the handler reconnected"
+        first.join(5.0)
+        assert not first.is_alive(), "the old keepalive exited"
+        left = {t for t in threading.enumerate() if t.name == "menlo-sdk-keepalive"} - before
+        assert len(left) == 1, f"{len(left)} keepalive threads after the reconnect"
+        assert robot.connected and len(made) == 2 and made[0].closed
+    finally:
+        robot.close()

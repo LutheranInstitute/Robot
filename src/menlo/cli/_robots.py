@@ -10,7 +10,6 @@ import argparse
 import json
 import re
 import socket
-import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -26,6 +25,7 @@ from menlo.asimov import (
     RobotStore,
     StoredRobot,
     UdpConfig,
+    _clock,
 )
 from menlo.asimov.connection import MODES, ConnectMode
 from menlo.asimov.store import FLAGS
@@ -95,14 +95,14 @@ def check_credential(robot: StoredRobot) -> tuple[Check, ManagerGrant | None]:
 def check_udp(robot: StoredRobot) -> Check:
     """Connect on ``udp`` and count state samples."""
     host = robot.udp_host or ""
-    started = time.monotonic()
+    started = _clock.monotonic()
     try:
         with Robot(ConnectionConfig(udp=udp_config(host))).connect(
             "udp", timeout=UDP_TIMEOUT_S
         ) as r:
-            first = time.monotonic() - started
+            first = _clock.monotonic() - started
             rate = StateRate(r)
-            time.sleep(RATE_WINDOW_S)
+            _clock.sleep(RATE_WINDOW_S)
             return Check(
                 "udp",
                 "ok",
@@ -136,7 +136,7 @@ def check_livekit(robot: StoredRobot, *, state: bool) -> Check:
             if not state:
                 return Check("livekit", "ok", f"room joined ({has})")
             rate = StateRate(r)
-            time.sleep(RATE_WINDOW_S)
+            _clock.sleep(RATE_WINDOW_S)
             return Check("livekit", "ok", f"room joined, state {rate.hz:.0f} Hz ({has})")
     except CompatibilityError as exc:
         return Check("livekit", "fail", str(exc))

@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from menlo.asimov import _clock
 from menlo.asimov._errors import UnsupportedError, WaitTimeoutError
 
 if TYPE_CHECKING:
@@ -57,7 +58,7 @@ class Frame:
     timestamp_ns: int = 0  # edge clock at capture; 0 when the transport did not carry one
     sequence: int = 0
 
-    received_at: float = field(default_factory=time.monotonic)
+    received_at: float = field(default_factory=_clock.monotonic)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -65,7 +66,7 @@ class Frame:
 
     @property
     def age_s(self) -> float:
-        return time.monotonic() - self.received_at
+        return _clock.monotonic() - self.received_at
 
     def to_numpy(self) -> Any:
         """Raw encodings as an ``ndarray`` of shape (height, width[, channels]), zero-copy where
@@ -116,7 +117,7 @@ class AudioChunk:
     timestamp_ns: int = 0
     sequence: int = 0
 
-    received_at: float = field(default_factory=time.monotonic)
+    received_at: float = field(default_factory=_clock.monotonic)
 
     @property
     def duration_s(self) -> float:
@@ -286,7 +287,7 @@ class Camera(_Stream[Frame]):
         self._subscribers.append(frames.append)
         started_at = time.time()
         try:
-            time.sleep(seconds)
+            _clock.sleep(seconds)
         finally:
             with contextlib.suppress(ValueError):
                 self._subscribers.remove(frames.append)

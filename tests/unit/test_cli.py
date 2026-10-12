@@ -2,16 +2,16 @@
 checks, the check before every motion command, and the saved-robots round trip.
 
 Commands that talk to a robot reach the fake edge through two seams: ``config_for`` (the
-connection a command uses) and ``udp_config`` (the one the checks use), because a saved
-robot names a host and the edge's default ports, and the fake edge listens elsewhere.
+connection a command uses) and ``udp_config`` (the one the checks use), both pointed at a
+robot ``lab`` on 127.0.0.1; the ``edge`` and ``fw_edge`` fixtures make every UDP lane an
+in-memory one over the fake edge. Time is the virtual clock's: ``menlo status``'s rate
+window, a walk's duration and an arming timeout run the fake edge and return at once.
 """
 
 from __future__ import annotations
 
 import io
 import json
-import threading
-import time
 from collections.abc import Callable
 
 import pytest
@@ -26,35 +26,32 @@ from menlo.asimov import (
     UdpConfig,
     _version,
 )
+from menlo.asimov.transport.udp import UdpTransport
 from menlo.cli import _common, _drive, _robots, build_parser, main
-from tests.conftest import FakeEdge, route_manager_rooms_to, route_udp_to
+from tests.conftest import FakeEdge, VirtualClock, connect_udp, route_manager_rooms_to
 
 CRED = "eyJpZCI6ImEwY2QxNmRiIn0.secret"
 
 
-def _udp(edge: FakeEdge) -> UdpConfig:
-    return UdpConfig("127.0.0.1", command_port=edge.command_port, state_bind=("127.0.0.1", 0))
-
-
 @pytest.fixture
 def at_edge(monkeypatch):
-    """Point every command and every check at ``edge``."""
-
-    def point(edge: FakeEdge) -> None:
-        monkeypatch.setattr(
-            _common, "config_for", lambda args: ConnectionConfig(udp=_udp(edge), name="lab")
-        )
-        monkeypatch.setattr(_robots, "udp_config", lambda host: _udp(edge))
-
-    return point
+    """Point every command and every check at ``lab`` on 127.0.0.1, which the ``edge`` or
+    ``fw_edge`` fixture routes to its fake edge."""
+    # Port 0 on loopback, as every test socket: a real transport that got past the
+    # compatibility gate (``udp_gate``) must not take the machine's real state port.
+    lab = UdpConfig("127.0.0.1", state_bind=("127.0.0.1", 0))
+    monkeypatch.setattr(_common, "config_for", lambda args: ConnectionConfig(udp=lab, name="lab"))
+    monkeypatch.setattr(_robots, "udp_config", lambda host: lab)
 
 
 @pytest.fixture
-def fw_edge(monkeypatch):
-    e = FakeEdge(firmware=True, state_hz=200.0)
-    route_udp_to(e, monkeypatch)
-    yield e
-    e.close()
+def udp_gate(edge, monkeypatch):
+    """The real ``UdpTransport`` for the UDP lane instead of the in-memory one: its
+    ``open()`` runs the Robot OS compatibility gate, where these tests end, before it opens
+    a socket."""
+    from menlo.asimov import connection
+
+    monkeypatch.setattr(connection, "UdpTransport", UdpTransport)
 
 
 # ── parsing ──────────────────────────────────────────────────────────────────
@@ -159,7 +156,6 @@ def test_the_saved_robots_round_trip_and_json_never_shows_the_credential(capsys)
 def test_robots_add_checks_the_credential_udp_and_room_then_saves_the_room(
     edge, manager, monkeypatch, at_edge, capsys
 ):
-    at_edge(edge)
     route_manager_rooms_to(edge, monkeypatch)
     manager.reply["role"] = "control"
     argv = ["robots", "add", "lab", "--mode", "hybrid", "--udp", "127.0.0.1",
@@ -197,7 +193,6 @@ def test_an_observe_credential_is_saved_with_a_warning(edge, manager, monkeypatc
 
 
 def test_a_silent_robot_fails_the_udp_check_with_what_to_fix(edge, monkeypatch, at_edge, capsys):
-    at_edge(edge)
     edge.pushing = False
     monkeypatch.setattr(_robots, "UDP_TIMEOUT_S", 0.3)
     assert main(["robots", "add", "lab", "--mode", "udp", "--udp", "127.0.0.1"]) == 1
@@ -207,10 +202,9 @@ def test_a_silent_robot_fails_the_udp_check_with_what_to_fix(edge, monkeypatch, 
 
 
 def test_robots_add_reports_compatibility_error_as_a_failed_check(
-    edge, monkeypatch, at_edge, capsys
+    udp_gate, monkeypatch, at_edge, capsys
 ):
     """An unsupported UDP target must reach the normal add failure and --no-check hint."""
-    at_edge(edge)
     monkeypatch.setattr(
         _version,
         "_fetch_version_document",
@@ -226,10 +220,9 @@ def test_robots_add_reports_compatibility_error_as_a_failed_check(
 
 
 def test_hybrid_add_continues_to_livekit_after_udp_compatibility_error(
-    edge, manager, monkeypatch, at_edge, capsys
+    edge, udp_gate, manager, monkeypatch, at_edge, capsys
 ):
     """A failed UDP preflight must not hide the hybrid configuration's LiveKit result."""
-    at_edge(edge)
     route_manager_rooms_to(edge, monkeypatch)
     monkeypatch.setattr(
         _version,
@@ -316,7 +309,6 @@ def test_setup_needs_a_terminal(capsys):
 
 
 def test_the_wizard_asks_only_what_the_mode_needs_checks_and_saves(edge, at_edge, capsys):
-    at_edge(edge)
     ask = Script("lab", "udp", "127.0.0.1")
     assert _robots.wizard(RobotStore(), ask) == 0
     assert ask.asked == ["Robot name", "Connection mode", "Robot address"]
@@ -329,7 +321,6 @@ def test_the_wizard_asks_only_what_the_mode_needs_checks_and_saves(edge, at_edge
 def test_the_wizard_saves_nothing_when_a_check_fails_and_you_say_no(
     edge, monkeypatch, at_edge, capsys
 ):
-    at_edge(edge)
     edge.pushing = False
     monkeypatch.setattr(_robots, "UDP_TIMEOUT_S", 0.3)
     ask = Script("lab", "udp", "127.0.0.1", False)
@@ -339,10 +330,9 @@ def test_the_wizard_saves_nothing_when_a_check_fails_and_you_say_no(
 
 
 def test_the_wizard_offers_save_anyway_after_compatibility_error(
-    edge, monkeypatch, at_edge, capsys
+    udp_gate, monkeypatch, at_edge, capsys
 ):
     """An unsupported target must remain one failed check in the interactive wizard."""
-    at_edge(edge)
     monkeypatch.setattr(
         _version,
         "_fetch_version_document",
@@ -380,7 +370,6 @@ def test_the_wizard_keeps_a_saved_credential_and_asks_about_the_default(manager,
 
 
 def test_status_json_reports_the_facts_and_sends_nothing(edge, at_edge, capsys):
-    at_edge(edge)
     assert main(["status", "--json"]) == 0
     snap = json.loads(capsys.readouterr().out)
     assert snap["robot"] == "lab" and snap["mode"] == "udp" and snap["host"] == "127.0.0.1"
@@ -391,7 +380,6 @@ def test_status_json_reports_the_facts_and_sends_nothing(edge, at_edge, capsys):
 
 
 def test_status_shows_a_fault_by_name(edge, at_edge, capsys):
-    at_edge(edge)
     edge.state.error_flags = 1 | (1 << 8)
     assert main(["status"]) == 0
     out = capsys.readouterr().out
@@ -404,25 +392,26 @@ def test_status_shows_a_fault_by_name(edge, at_edge, capsys):
 class Answer(io.StringIO):
     """What the person at the terminal types; ``then`` runs when the answer is read."""
 
-    def __init__(self, text: str, then=None) -> None:
+    def __init__(self, clock: VirtualClock, text: str, then=None) -> None:
         super().__init__(text)
+        self.clock = clock
         self.then = then
         self.read_at: float | None = None
 
     def readline(self, *args):
-        self.read_at = time.monotonic()
+        self.read_at = self.clock.monotonic()
         if self.then is not None:
             self.then()
         return super().readline(*args)
 
 
 @pytest.fixture
-def answer(monkeypatch):
+def answer(clock, monkeypatch):
     """A terminal to ask on, answered with ``text``."""
     from menlo.cli import _ui
 
     def type_(text: str, then=None) -> Answer:
-        typed = Answer(text, then)
+        typed = Answer(clock, text, then)
         monkeypatch.setattr(_ui, "interactive", lambda: True)
         monkeypatch.setattr("sys.stdin", typed)
         return typed
@@ -435,32 +424,26 @@ FACTS_TEMP = "joint temperatures not reported"
 
 
 def _armed_stand(edge: FakeEdge) -> None:
-    with Robot(ConnectionConfig(udp=_udp(edge))).connect("udp", timeout=3.0) as robot:
+    with connect_udp(edge, timeout=3.0) as robot:
         robot.stand()  # returns once armed
 
 
 def _balancing(edge: FakeEdge) -> None:
     """DAMP -> STAND -> MOVE, as a user would before `menlo walk`."""
-    with Robot(ConnectionConfig(udp=_udp(edge))).connect("udp", timeout=3.0) as robot:
+    with connect_udp(edge, timeout=3.0) as robot:
         robot.stand()
         robot.balance()  # returns once MOVE is reported
 
 
-def _once_walking(edge: FakeEdge, then: Callable[[], None]) -> threading.Thread:
-    """Call ``then`` (in a thread) 0.3 s after the first nonzero velocity arrives."""
+def _once_walking(edge: FakeEdge, then: Callable[[], None]) -> None:
+    """Call ``then`` on the clock 0.3 s after the first nonzero velocity arrives."""
 
     def watch() -> None:
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            if any(v != (0.0, 0.0, 0.0) for v in edge.velocities()):
-                time.sleep(0.3)
-                then()
-                return
-            time.sleep(0.01)
+        if any(v != (0.0, 0.0, 0.0) for v in edge.velocities()):
+            watching.cancel()
+            edge.clock.call_later(0.3, then)
 
-    thread = threading.Thread(target=watch, daemon=True)
-    thread.start()
-    return thread
+    watching = edge.clock.call_every(0.01, watch)
 
 
 def test_the_yes_flag_is_shared_by_the_commands_that_send(capsys):
@@ -479,7 +462,6 @@ def test_the_yes_flag_is_shared_by_the_commands_that_send(capsys):
 
 
 def test_stand_prints_the_plan_asks_and_stands_on_yes(fw_edge, at_edge, answer, capsys):
-    at_edge(fw_edge)
     answer("y\n")
     assert main(["stand"]) == 0
     out = capsys.readouterr().out
@@ -492,7 +474,6 @@ def test_stand_prints_the_plan_asks_and_stands_on_yes(fw_edge, at_edge, answer, 
 
 
 def test_stand_on_an_armed_stand_says_armed_and_sends_nothing(fw_edge, at_edge, capsys):
-    at_edge(fw_edge)
     _armed_stand(fw_edge)
     fw_edge.received.clear()
     assert main(["stand"]) == 0  # a new session: it has not yet seen 0.5 s upright
@@ -503,7 +484,6 @@ def test_stand_on_an_armed_stand_says_armed_and_sends_nothing(fw_edge, at_edge, 
 def test_stand_on_a_stand_that_does_not_arm_waits_and_is_not_ready(
     fw_edge, at_edge, monkeypatch, capsys
 ):
-    at_edge(fw_edge)
     fw_edge.set_mode("stand")
     fw_edge.state.projected_gravity[:] = [0.0, 0.6, -0.8]  # tilted: the firmware never arms
     monkeypatch.setattr(_drive, "STAND_TIMEOUT_S", 0.3)
@@ -518,7 +498,6 @@ def test_stand_on_a_stand_that_does_not_arm_waits_and_is_not_ready(
 
 @pytest.mark.parametrize("typed", ["n\n", "\n", "", "nope\n"])
 def test_anything_but_yes_cancels_and_sends_nothing(edge, at_edge, answer, capsys, typed):
-    at_edge(edge)
     answer(typed)
     assert main(["damp"]) == 4
     out = capsys.readouterr().out
@@ -530,7 +509,6 @@ def test_anything_but_yes_cancels_and_sends_nothing(edge, at_edge, answer, capsy
 
 
 def test_no_terminal_and_no_yes_is_a_usage_error_and_sends_nothing(edge, at_edge, capsys):
-    at_edge(edge)
     edge.set_mode("stand")
     assert main(["damp"]) == 2
     captured = capsys.readouterr()
@@ -542,7 +520,6 @@ def test_no_terminal_and_no_yes_is_a_usage_error_and_sends_nothing(edge, at_edge
 
 
 def test_walk_plans_the_clamped_speed_and_yes_skips_the_question(fw_edge, at_edge, capsys):
-    at_edge(fw_edge)
     _balancing(fw_edge)
     fw_edge.received.clear()
     assert main(["walk", "--vx", "0.6", "--vyaw", "-0.2", "--duration", "0.4", "--yes"]) == 0
@@ -561,7 +538,6 @@ def test_walk_plans_the_clamped_speed_and_yes_skips_the_question(fw_edge, at_edg
 def test_balance_from_stand_asks_waits_until_armed_and_enters_move(
     fw_edge, at_edge, answer, capsys
 ):
-    at_edge(fw_edge)
     _armed_stand(fw_edge)
     fw_edge.received.clear()
     answer("yes\n")
@@ -574,7 +550,6 @@ def test_balance_from_stand_asks_waits_until_armed_and_enters_move(
 
 
 def test_balance_from_stand_on_no_sends_nothing(fw_edge, at_edge, answer, capsys):
-    at_edge(fw_edge)
     _armed_stand(fw_edge)
     fw_edge.received.clear()
     answer("n\n")
@@ -597,7 +572,6 @@ def test_balance_from_stand_on_no_sends_nothing(fw_edge, at_edge, answer, capsys
 def test_the_facts_never_refuse_they_are_shown_and_asked_about(
     fw_edge, at_edge, answer, capsys, setup, argv, shows
 ):
-    at_edge(fw_edge)
     setup(fw_edge)
     fw_edge.received.clear()
     typed = answer("n\n")
@@ -611,7 +585,6 @@ def test_the_facts_never_refuse_they_are_shown_and_asked_about(
 def test_the_plan_names_active_alerts_and_the_hottest_joint_and_still_sends(
     fw_edge, at_edge, capsys
 ):
-    at_edge(fw_edge)
     fw_edge.state.joint_temp.extend([40.0] * len(fw_edge.state.joint_pos))
     fw_edge.state.joint_temp[2] = 75.0
     a = fw_edge.state.active_alerts.add()
@@ -625,7 +598,6 @@ def test_the_plan_names_active_alerts_and_the_hottest_joint_and_still_sends(
 def test_stand_from_move_warns_to_support_the_robot_then_sends_stand(
     fw_edge, at_edge, answer, capsys
 ):
-    at_edge(fw_edge)
     _balancing(fw_edge)
     fw_edge.received.clear()
     answer("y\n")
@@ -638,7 +610,6 @@ def test_stand_from_move_warns_to_support_the_robot_then_sends_stand(
 
 
 def test_walk_from_an_armed_stand_is_sent_and_the_robot_enters_move(fw_edge, at_edge, capsys):
-    at_edge(fw_edge)
     _armed_stand(fw_edge)
     fw_edge.received.clear()
     assert main(["walk", "--vx", "0.2", "--duration", "0.4", "--yes"]) == 0
@@ -647,7 +618,6 @@ def test_walk_from_an_armed_stand_is_sent_and_the_robot_enters_move(fw_edge, at_
 
 
 def test_walk_in_damp_is_sent_and_reports_that_the_robot_did_not_walk(fw_edge, at_edge, capsys):
-    at_edge(fw_edge)
     assert main(["walk", "--vx", "0.2", "--duration", "0.3", "--yes"]) == 3
     out = capsys.readouterr().out
     assert "the robot reports DAMP" in out and "Run `menlo balance` first" in out
@@ -655,7 +625,6 @@ def test_walk_in_damp_is_sent_and_reports_that_the_robot_did_not_walk(fw_edge, a
 
 
 def test_balance_in_damp_is_sent_and_says_stand_first(fw_edge, at_edge, capsys):
-    at_edge(fw_edge)
     assert main(["balance", "--yes"]) == 3
     assert "the robot is in DAMP: stand() first" in capsys.readouterr().err
     assert fw_edge.velocities() == [(0.0, 0.0, 0.0)]
@@ -664,7 +633,6 @@ def test_balance_in_damp_is_sent_and_says_stand_first(fw_edge, at_edge, capsys):
 def test_balance_before_arming_is_sent_and_says_how_the_robot_arms(
     fw_edge, at_edge, answer, monkeypatch, capsys
 ):
-    at_edge(fw_edge)
     fw_edge.set_mode("stand")
     fw_edge.state.projected_gravity[:] = [0.0, 0.6, -0.8]
     monkeypatch.setattr(_drive, "ARM_TIMEOUT_S", 0.3)
@@ -676,14 +644,13 @@ def test_balance_before_arming_is_sent_and_says_how_the_robot_arms(
     assert fw_edge.velocities() == [(0.0, 0.0, 0.0)]
 
 
-def test_stale_state_is_not_feasible(edge, at_edge, answer, monkeypatch, capsys):
-    at_edge(edge)
+def test_stale_state_is_not_feasible(clock, edge, at_edge, answer, monkeypatch, capsys):
     edge.set_mode("move")
     real = Robot.preflight
 
     def stale(self, action="move"):
         edge.pushing = False
-        time.sleep(0.7)
+        clock.sleep(0.7)
         return real(self, action)
 
     monkeypatch.setattr(Robot, "preflight", stale)
@@ -695,15 +662,14 @@ def test_stale_state_is_not_feasible(edge, at_edge, answer, monkeypatch, capsys)
 
 
 def test_a_fault_while_you_read_the_plan_is_reported_after_the_walk_is_sent(
-    fw_edge, at_edge, answer, capsys
+    clock, fw_edge, at_edge, answer, capsys
 ):
-    at_edge(fw_edge)
     _balancing(fw_edge)
     fw_edge.received.clear()
 
     def the_robot_falls_while_you_read() -> None:
         fw_edge.fault()
-        time.sleep(0.1)  # a few samples at 200 Hz
+        clock.sleep(0.1)  # a few samples at 200 Hz
 
     answer("y\n", then=the_robot_falls_while_you_read)
     assert main(["walk", "--vx", "0.2", "--duration", "0.5"]) == 3
@@ -714,7 +680,7 @@ def test_a_fault_while_you_read_the_plan_is_reported_after_the_walk_is_sent(
 
 
 def test_stand_that_never_reaches_stand_is_not_ready(edge, at_edge, monkeypatch, capsys):
-    at_edge(edge)  # this edge never changes robot mode
+    # this edge never changes robot mode
     monkeypatch.setattr(_drive, "STAND_TIMEOUT_S", 0.3)
     assert main(["stand", "--yes"]) == 3
     assert "sent STAND, but the robot was not armed" in capsys.readouterr().err
@@ -729,12 +695,11 @@ def test_walk_needs_a_bounded_duration(capsys):
     assert "give --vx" in capsys.readouterr().err
 
 
-def test_ctrl_c_during_a_walk_stops_the_robot(fw_edge, at_edge, monkeypatch):
-    at_edge(fw_edge)
+def test_ctrl_c_during_a_walk_stops_the_robot(clock, fw_edge, at_edge, monkeypatch):
     fw_edge.set_mode("move")
 
     def interrupted(self, done, duration, sent):
-        time.sleep(0.2)
+        clock.sleep(0.2)
         raise KeyboardInterrupt
 
     monkeypatch.setattr(Robot, "_await_hold", interrupted)
@@ -743,16 +708,13 @@ def test_ctrl_c_during_a_walk_stops_the_robot(fw_edge, at_edge, monkeypatch):
     assert (0.3, 0.0, 0.0) in velocities and velocities[-1] == (0.0, 0.0, 0.0)
 
 
-def test_a_fault_during_a_walk_is_reported_and_is_not_done(fw_edge, at_edge, capsys):
-    at_edge(fw_edge)
+def test_a_fault_during_a_walk_is_reported_and_is_not_done(clock, fw_edge, at_edge, capsys):
     _balancing(fw_edge)
     fw_edge.received.clear()
-    started = time.monotonic()
-    fall = _once_walking(fw_edge, fw_edge.fault)
-    code = main(["walk", "--vx", "0.2", "--duration", "3", "--yes"])
-    fall.join()
-    assert code == 3
-    assert time.monotonic() - started < 2.5  # the fault ended it, not 3 s
+    started = clock.monotonic()
+    _once_walking(fw_edge, fw_edge.fault)
+    assert main(["walk", "--vx", "0.2", "--duration", "3", "--yes"]) == 3
+    assert clock.monotonic() - started < 2.5  # the fault ended it, not 3 s
     captured = capsys.readouterr()
     assert "Walk done." not in captured.out
     assert "menlo walk: the walk ended after" in captured.err
@@ -763,19 +725,18 @@ def test_a_fault_during_a_walk_is_reported_and_is_not_done(fw_edge, at_edge, cap
 def test_a_fault_during_a_walk_is_a_RobotFaultedError_that_carries_what_was_sent(fw_edge, at_edge):
     """A NotReadyError means nothing was sent; a fault after the velocity went out is the
     subclass, with the state that showed it and the command that was in force."""
-    at_edge(fw_edge)
     _balancing(fw_edge)
-    fall = _once_walking(fw_edge, fw_edge.fault)
+    _once_walking(fw_edge, fw_edge.fault)
     args = build_parser().parse_args(["walk", "--vx", "0.2", "--duration", "3", "--yes"])
     with pytest.raises(RobotFaultedError) as exc:
         _drive.walk(args)
-    fall.join()
     assert exc.value.state.faulted and exc.value.action == "move"
     assert exc.value.sent is not None and exc.value.sent.name == "set_velocity"
 
 
-def test_balance_repeats_the_zero_only_while_the_robot_is_still_in_move(edge, at_edge, monkeypatch):
-    at_edge(edge)
+def test_balance_repeats_the_zero_only_while_the_robot_is_still_in_move(
+    clock, edge, at_edge, monkeypatch
+):
     edge.set_mode("move")
     real = Robot.balance
 
@@ -786,12 +747,12 @@ def test_balance_repeats_the_zero_only_while_the_robot_is_still_in_move(edge, at
 
     monkeypatch.setattr(Robot, "balance", balance_then_another_controller_stands)
     assert main(["balance"]) == 0
-    time.sleep(0.2)
+    clock.sleep(0.2)
     assert edge.velocities() == [(0.0, 0.0, 0.0)]
 
 
 def test_balance_in_move_never_asks_and_sends_zero_at_once(edge, at_edge, capsys):
-    at_edge(edge)  # no terminal and no --yes: balance in MOVE still runs
+    # no terminal and no --yes: balance in MOVE still runs
     edge.set_mode("move")
     assert main(["balance"]) == 0
     assert "balancing in place" in capsys.readouterr().out
@@ -800,7 +761,6 @@ def test_balance_in_move_never_asks_and_sends_zero_at_once(edge, at_edge, capsys
 
 
 def test_balance_from_stand_with_no_terminal_and_no_yes_sends_nothing(fw_edge, at_edge, capsys):
-    at_edge(fw_edge)
     _armed_stand(fw_edge)
     fw_edge.received.clear()
     assert main(["balance"]) == 2

@@ -8,12 +8,11 @@ from __future__ import annotations
 import argparse
 import collections
 import threading
-import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Protocol
 
-from menlo.asimov import ConnectionConfig, Robot, State
+from menlo.asimov import ConnectionConfig, Robot, State, _clock
 
 EXIT_OK = 0
 EXIT_ERROR = 1  # a connection, robot or saved-robots error
@@ -57,7 +56,7 @@ class StateRate:
         self._window = window_s
         self._times: collections.deque[float] = collections.deque()
         self._lock = threading.Lock()
-        self._started = time.monotonic()
+        self._started = _clock.monotonic()
         robot.on_state = self._seen
 
     def _seen(self, state: State) -> None:
@@ -67,7 +66,7 @@ class StateRate:
     @property
     def hz(self) -> float:
         """Samples per second over the last ``window_s`` (or since counting began)."""
-        now = time.monotonic()
+        now = _clock.monotonic()
         with self._lock:
             while self._times and now - self._times[0] > self._window:
                 self._times.popleft()

@@ -101,6 +101,9 @@ class UdpTransport:
         self._allow_unsupported_target = allow_unsupported_target
         self.endpoint = f"{host}:{command_port}"
         self._sock: socket.socket | None = None
+        # Where the state socket is bound while open: the port Asimov Edge must push to.
+        # It is the real one when ``state_bind`` asked for port 0.
+        self._state_address: tuple[str, int] | None = None
         self._reader: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -147,6 +150,8 @@ class UdpTransport:
             ) from exc
         sock.settimeout(0.2)
         self._sock = sock
+        bound = sock.getsockname()
+        self._state_address = (str(bound[0]), int(bound[1]))
         # One stop flag per open, handed to its reader with its socket: close() may run on
         # the reader thread (a state callback that reconnects), and an open() that cleared a
         # shared flag would revive that reader on a closed socket beside the new one.
@@ -167,6 +172,7 @@ class UdpTransport:
             with contextlib.suppress(OSError):
                 self._sock.close()
             self._sock = None
+        self._state_address = None
 
     # ── subscriptions ────────────────────────────────────────────────────────
     def subscribe_state(self, callback: StateCallback) -> None:

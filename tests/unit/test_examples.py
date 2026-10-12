@@ -3,12 +3,17 @@
 The examples are the code the documentation shows, so each one is executed here as a
 script. A test changes a setting the way a user would, by editing the constant at the top
 of the file (``settings=``), or uncomments the two guard lines a motion script carries
-(``guarded=True``). Two seams point the scripts at the fake edge: the ``UdpConfig``
-they build (or the one ``Robot()`` builds from ``MENLO_UDP_HOST``) gets the fake edge's
-ports, and a LiveKit room is the fake client from ``conftest``. The fake edge runs with
+(``guarded=True``). Two seams point the scripts at the fake edge: the UDP lane any config
+builds (theirs, or the one ``Robot()`` builds from ``MENLO_UDP_HOST``) is the in-memory
+one from ``conftest``, and a LiveKit room is the fake client. The fake edge runs with
 ``firmware=True``, so stand, arming and MOVE behave as on the robot. The interactive
 script (keyboard.py) takes its key source as the argument of ``main()``; here it is a
 scripted one.
+
+The scripts run on the virtual clock: their ``time.sleep`` and ``time.monotonic`` are the
+clock's while they run, so a 1 s walk is a function call. The camera's ``photo()`` and the
+microphone's ``chunks()`` wait on another thread's delivery, so the ``camera`` fixture also
+feeds them from a thread on the real clock.
 
 Several tests remove nothing and add nothing to an example: they fail when a check of its
 own is removed (guard.py's rule, the MOVE-only rule of a walk, a bounded hold per key press,
@@ -18,41 +23,40 @@ the question before a stand from MOVE or a rest).
 from __future__ import annotations
 
 import asyncio
+import builtins
 import io
+import itertools
 import re
 import sys
 import threading
 import time
+import types
 import urllib.error
 import wave
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 import menlo.asimov
-from menlo.asimov import Frame, UdpConfig, _version, connection, store
-from menlo.asimov.transport.livekit import LiveKitTransport
-from tests.conftest import (
-    FakeEdge,
-    FakeLiveKitClient,
-    FakeManager,
-    SeamHybridTransport,
-    route_udp_to,
-)
+from menlo.asimov import Frame, _clock, _version, connection
+from menlo.asimov.transport.udp import UdpTransport
+from tests.conftest import FakeEdge, FakeLiveKitClient, FakeManager, VirtualClock, route_rooms_to
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 CREDENTIAL = "eyJpZCI6ImEwY2QxNmRiIn0.secret"
 ZERO = (0.0, 0.0, 0.0)
 
 Run = Callable[..., str]
+_REAL_SLEEP, _REAL_MONOTONIC = time.sleep, time.monotonic
 
 
 class Keys:
     """A scripted key source for ``main(next_key)``: each item is a key, or ``None`` for a
-    tick in which no key is pressed (it waits the tick out, as a terminal would). After the
-    last item it presses ``x``. ``pressed`` records when each key was handed out."""
+    tick in which no key is pressed (it waits the tick out on the SDK's clock, as a terminal
+    would on the wall clock). After the last item it presses ``x``. ``pressed`` records the
+    clock time each key was handed out."""
 
     def __init__(self, script: Iterable[str | None]) -> None:
         self.script = list(script)
@@ -61,9 +65,9 @@ class Keys:
     def __call__(self, timeout: float) -> str | None:
         key = self.script.pop(0) if self.script else "x"
         if key is None:
-            time.sleep(timeout)
+            _clock.sleep(timeout)
             return None
-        self.pressed.append((key, time.monotonic()))
+        self.pressed.append((key, _clock.monotonic()))
         return key
 
     def last(self, key: str) -> float:
@@ -76,54 +80,40 @@ def idle(seconds: float, tick: float = 0.1) -> list[None]:
 
 
 @pytest.fixture
-def fw_edge(monkeypatch) -> Iterator[FakeEdge]:
-    e = FakeEdge(firmware=True, state_hz=200.0)
-    route_udp_to(e, monkeypatch)
-    e.state.joint_temp.extend([35.0] * 25)
-    e.state.base_ang_vel.extend([0.0, 0.0, 0.0])
-    yield e
-    e.close()
+def fw_edge(fw_edge: FakeEdge) -> FakeEdge:
+    """The firmware fake edge from ``conftest``, with the temperatures and angular velocity
+    check.py and guard.py read."""
+    fw_edge.state.joint_temp.extend([35.0] * 25)
+    fw_edge.state.base_ang_vel.extend([0.0, 0.0, 0.0])
+    return fw_edge
 
 
 @pytest.fixture
 def rooms(fw_edge, monkeypatch) -> list[FakeLiveKitClient]:
     """Every LiveKit room a config opens is the fake client over ``fw_edge``. Returns the
     clients, so a test can push camera frames and audio into them."""
-    clients: list[FakeLiveKitClient] = []
-
-    class Room(LiveKitTransport):
-        def __init__(self, url, room, *, token, **kw):
-            client = FakeLiveKitClient(fw_edge, token=token() if callable(token) else token)
-            clients.append(client)
-            super().__init__(url, room, token=token, client=client, **kw)
-
-    class Hybrid(SeamHybridTransport):
-        def __init__(self, host, *, livekit_url, room, token, **kw):
-            client = FakeLiveKitClient(fw_edge, carry_state=False)
-            clients.append(client)
-            super().__init__(
-                fw_edge, host, livekit_url=livekit_url, room=room, token=token, client=client, **kw
-            )
-
-    monkeypatch.setattr(connection, "LiveKitTransport", Room)
-    monkeypatch.setattr(connection, "HybridTransport", Hybrid)
-    return clients
+    return route_rooms_to(fw_edge, monkeypatch)
 
 
 @pytest.fixture
-def camera(rooms) -> Iterator[Callable[[Frame | None], None]]:
-    """Feed frames and audio into every joined room at about 30 Hz while a test runs.
-    Call the returned function to change the frame that is fed, or with ``None`` to stop
-    feeding frames (a frozen camera)."""
+def camera(clock: VirtualClock, rooms) -> Iterator[Callable[[Frame | None], None]]:
+    """Feed frames and audio into every joined room while a test runs. Call the returned
+    function to change the frame that is fed, or with ``None`` to stop feeding frames (a
+    frozen camera).
+
+    Two feeders share one sequence: every 30 ms of the virtual clock, for
+    ``capture_clip()``, which sleeps on the SDK's clock; and every 10 ms of the real clock,
+    for ``photo()`` and ``chunks()``, which wait on a condition variable for another
+    thread's delivery and move no clock while they wait."""
     frame: list[Frame | None] = [
         Frame(width=4, height=2, encoding="rgb8", data=bytes(24), stride_bytes=12)
     ]
-    stop = threading.Event()
+    sequence = itertools.count(1)
+    lock = threading.Lock()
 
     def feed() -> None:
-        n = 0
-        while not stop.is_set():
-            n += 1
+        with lock:
+            n = next(sequence)
             for client in tuple(rooms):
                 f = frame[0]
                 if client.connected and f is not None:
@@ -131,42 +121,88 @@ def camera(rooms) -> Iterator[Callable[[Frame | None], None]]:
                     for cb in tuple(client._video_cbs):
                         cb(live)
                     client.push_audio(n, samples=480)
-            time.sleep(0.03)
 
-    thread = threading.Thread(target=feed, daemon=True)
+    stop = threading.Event()
+
+    def feed_in_real_time() -> None:
+        while not stop.wait(0.01):  # not time.sleep: run() makes that the virtual clock's
+            feed()
+
+    task = clock.call_every(0.03, feed)
+    thread = threading.Thread(target=feed_in_real_time, daemon=True)
     thread.start()
     yield lambda f: frame.__setitem__(0, f)
+    task.cancel()
     stop.set()
     thread.join(timeout=1.0)
 
 
-@pytest.fixture
-def manager() -> Iterator[FakeManager]:
-    server = FakeManager()
-    yield server
-    server.shutdown()
+def _only_loopback(build: Callable[..., Any]) -> Callable[..., Any]:
+    """``build`` (a transport class a config calls), refusing any host but 127.0.0.1, and
+    binding the state socket to port 0 on loopback as every test socket is: a real transport
+    that got past the compatibility gate must not take the machine's real state port."""
+
+    def build_at(host: str, **kw: Any) -> Any:
+        assert host == "127.0.0.1", "an example reached for a host other than the one given"
+        return build(host, **{**kw, "state_bind": ("127.0.0.1", 0)})
+
+    return build_at
 
 
 @pytest.fixture
-def run(fw_edge, monkeypatch, tmp_path, capsys) -> Run:
+def run(clock: VirtualClock, fw_edge, monkeypatch, tmp_path, capsys) -> Run:
     """Run ``examples/<name>`` and return what it printed.
 
     ``settings`` edits the constants at the top of the file, as a user would. ``guarded``
     uncomments the script's two guard lines, as a user would to turn guard.py on. ``keys``
     runs an interactive script's ``main()`` with a scripted key source. ``stdin`` is what
     the user types. The script must end with exit code ``code`` (finishing normally is 0).
+
+    The script's ``time.sleep`` and ``time.monotonic`` are the virtual clock's: its sleeps
+    advance the fake edge instead of the wall clock. Only the script's: its ``import time``
+    binds a copy of the module with those two replaced, and the real ``time`` stays as it is
+    for everything else in the process (the SDK's HTTP deadlines, asyncio, the camera
+    fixture's thread), which a patch of ``time.sleep`` itself would reach.
     """
 
-    def at_fake_edge(host: str, **_: object) -> UdpConfig:
-        assert host == "127.0.0.1", "an example reached for a host other than the one given"
-        return UdpConfig(
-            host,
-            command_port=fw_edge.command_port,
-            state_bind=("127.0.0.1", 0),
-        )
+    owner = threading.get_ident()
 
-    monkeypatch.setattr(menlo.asimov, "UdpConfig", at_fake_edge)
-    monkeypatch.setattr(store, "UdpConfig", at_fake_edge)
+    def only_the_test_thread(name: str) -> None:
+        # The clock is driven from one thread. Another thread calling the script's time
+        # would advance it underneath the test; say so instead of racing.
+        if threading.get_ident() != owner:
+            raise RuntimeError(
+                f"time.{name}() called from thread {threading.current_thread().name!r} while "
+                "the example's time is the virtual clock's; only the test thread may drive it"
+            )
+
+    def sleep(seconds: float) -> None:
+        only_the_test_thread("sleep")
+        # A wall-clock sleep wakes a little after its deadline, never on it. Woken exactly on
+        # a tick, stream_velocity.py's `% period` can read a whole period, not zero, and the
+        # script sends a second packet in that tick.
+        clock.sleep(seconds + 1e-6)
+
+    def monotonic() -> float:
+        only_the_test_thread("monotonic")
+        return clock.monotonic()
+
+    script_time = types.ModuleType("time", time.__doc__)
+    script_time.__dict__.update(time.__dict__, sleep=sleep, monotonic=monotonic)
+
+    def import_for_script(
+        name: str,
+        globals: Mapping[str, object] | None = None,
+        locals: Mapping[str, object] | None = None,
+        fromlist: Sequence[str] = (),
+        level: int = 0,
+    ) -> types.ModuleType:
+        if name == "time" and level == 0:
+            return script_time
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    for name in ("UdpTransport", "HybridTransport"):  # as routed to fw_edge
+        monkeypatch.setattr(connection, name, _only_loopback(getattr(connection, name)))
     monkeypatch.chdir(tmp_path)
 
     def run(
@@ -194,7 +230,12 @@ def run(fw_edge, monkeypatch, tmp_path, capsys) -> Run:
         monkeypatch.syspath_prepend(str(path.parent))  # as `python <path>` puts it first
         monkeypatch.setattr(sys, "argv", [str(path)])
         monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
-        namespace = {"__name__": "__main__" if keys is None else "example", "__file__": str(path)}
+        namespace: dict[str, Any] = {
+            "__name__": "__main__" if keys is None else "example",
+            "__file__": str(path),
+            # The script's own imports go through here; modules it imports keep theirs.
+            "__builtins__": {**vars(builtins), "__import__": import_for_script},
+        }
         try:
             exec(compile(source, str(path), "exec"), namespace)
             if keys is not None:
@@ -227,6 +268,15 @@ def _balancing(run: Run, fw_edge: FakeEdge) -> None:
 
 
 # ── check ────────────────────────────────────────────────────────────────────
+
+
+def test_the_virtual_time_is_the_scripts_alone(run, clock):
+    before = clock.now
+    run("check.py")  # sleeps 0.6 s, on its own time
+    assert clock.now >= before + 0.6
+    assert time.sleep is _REAL_SLEEP and time.monotonic is _REAL_MONOTONIC, (
+        "the process's time module was patched; only the script's import may be"
+    )
 
 
 def test_check_prints_the_facts_and_sends_nothing(run, fw_edge):
@@ -354,8 +404,11 @@ def test_connect_example_handles_incompatible_robot_without_a_traceback(run, mon
     """An unsupported Robot OS leaves the example at its application error boundary.
 
     Users see how to catch the narrower error before `ConnectError`, without exposing a
-    traceback or letting the SDK choose process termination.
+    traceback or letting the SDK choose process termination. The compatibility gate is the
+    real ``UdpTransport.open()``'s, which refuses before it opens a socket, so this test
+    builds the real transport.
     """
+    monkeypatch.setattr(connection, "UdpTransport", _only_loopback(UdpTransport))
     monkeypatch.setattr(
         _version,
         "_fetch_version_document",
@@ -478,10 +531,10 @@ def test_wait_until_needs_the_robot_supported(run, fw_edge):
     assert fw_edge.received == []
 
 
-def test_wait_until_acts_mid_move_once_the_joint_passes_the_angle(run, fw_edge):
+def test_wait_until_acts_mid_move_once_the_joint_passes_the_angle(run, clock, fw_edge):
     _armed(run, fw_edge)
     elbow = 15  # L_Elbow
-    started = time.monotonic()
+    started = clock.monotonic()
     out = run("wait_until.py", settings={"ROBOT_SUPPORTED": True, "DURATION_S": 1.0})
     m = re.search(r"L_Elbow at (\d\.\d\d) rad after (\d\.\d) s of 1\.0 s", out)
     assert m, out
@@ -491,7 +544,7 @@ def test_wait_until_acts_mid_move_once_the_joint_passes_the_angle(run, fw_edge):
     # The move back ends the first move where it is: the elbow never reached TURN_RAD.
     assert 0.3 <= max(targets) < 0.55 and targets[-1] <= 0.05, targets
     assert "L_Elbow back at 0.0" in out
-    assert time.monotonic() - started < 10.0
+    assert clock.monotonic() - started < 10.0
 
 
 def test_wait_until_in_stand_that_times_out_does_not_blame_damp(run, fw_edge, monkeypatch):

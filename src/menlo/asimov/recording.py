@@ -12,11 +12,11 @@ import enum
 import json
 import os
 import threading
-import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
+from menlo.asimov import _clock
 from menlo.asimov._outcome import Sent
 from menlo.asimov._state import State
 
@@ -61,7 +61,7 @@ class Recording:
 
     def _write(self, kind: str, obj: Any) -> None:
         # Called from the transport's reader thread (states) and the caller's thread (sent).
-        line = json.dumps({"t": time.monotonic(), "kind": kind, **_plain(obj)}) + "\n"
+        line = json.dumps({"t": _clock.monotonic(), "kind": kind, **_plain(obj)}) + "\n"
         with self._lock:
             if self._fh is not None:
                 self._fh.write(line)

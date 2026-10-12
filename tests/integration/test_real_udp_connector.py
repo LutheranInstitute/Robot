@@ -52,8 +52,7 @@ def _transport_to(conn, version_port: int) -> UdpTransport:
         version_port=version_port,
     )
     tx.open()
-    assert tx._sock is not None
-    conn.state_address = tx._sock.getsockname()
+    conn.state_address = tx._state_address
     return tx
 
 

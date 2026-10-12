@@ -15,6 +15,8 @@ import json
 import threading
 import time
 import wave
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 
@@ -93,9 +95,7 @@ def test_rejected_livekit_target_retires_identity_learned_while_rpc_was_pending(
         timeout: float,
     ) -> str:
         client.rpc_calls.append((destination_identity, method, payload, timeout))
-        deadline = time.monotonic() + 1.0
-        while robot._info is None and time.monotonic() < deadline:
-            time.sleep(0.01)
+        edge.clock.run_until(lambda: robot._info is not None, 1.0)
         assert robot._info is not None, "the test must exercise identity learned before rejection"
         return '{"robot_os_version":"9.0.0","robot_model":"unsupported"}'
 
@@ -201,12 +201,12 @@ def test_state_is_the_same_bytes_the_udp_lane_echoes(livekit_robot):
     assert robot.get_state().upright is True
 
 
-def test_an_undecodable_state_packet_is_dropped_not_fatal(livekit_robot):
+def test_an_undecodable_state_packet_is_dropped_not_fatal(clock, livekit_robot):
     client, robot = livekit_robot
     before = robot.get_state().sequence
     for cb in client._data_track_cbs[STATE_TRACK]:
         cb(b"\xff\xff\xff\xff not a protobuf", None)
-    time.sleep(0.05)
+    clock.sleep(0.05)
     assert robot.get_state().sequence >= before and robot.connected
 
 
@@ -249,10 +249,33 @@ def test_a_closed_room_stops_claiming_media(edge):
 # ── the camera API ────────────────────────────────────────────────────────────
 
 
+@contextmanager
+def feeding(client: FakeLiveKitClient, sequence: int) -> Iterator[None]:
+    """Push frame ``sequence`` from a real thread, every 10 ms, until the block ends.
+
+    ``photo()`` waits on a real condition variable for a frame that arrives after it
+    starts, on the real clock. One frame on a timer races the call (a loaded machine can
+    start it late, and the frame is then a stale one); a frame pushed again and again
+    arrives after the call however late it starts."""
+    stop = threading.Event()
+
+    def feed() -> None:
+        while not stop.wait(0.01):
+            client.push_frame(sequence)
+
+    thread = threading.Thread(target=feed, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
+
+
 def test_frames_are_rgb8_so_to_numpy_would_work(livekit_robot):
     client, robot = livekit_robot
-    threading.Timer(0.02, client.push_frame, args=(1,)).start()
-    frame = robot.camera.photo(timeout=1.0)
+    with feeding(client, 1):
+        frame = robot.camera.photo(timeout=1.0)
     assert frame.encoding == "rgb8", "yuv420 would make Frame.to_numpy() refuse"
     assert frame.shape == (2, 4) and frame.stride_bytes == 12
 
@@ -260,34 +283,30 @@ def test_frames_are_rgb8_so_to_numpy_would_work(livekit_robot):
 def test_photo_waits_for_a_fresh_frame_and_times_out_honestly(livekit_robot):
     client, robot = livekit_robot
     stale = client.push_frame(1)
-    threading.Timer(0.05, client.push_frame, args=(2,)).start()
-    fresh = robot.camera.photo(timeout=1.0)
+    with feeding(client, 2):
+        fresh = robot.camera.photo(timeout=1.0)
     assert fresh.sequence == 2 and fresh is not stale, "photo() must not return a cached frame"
     with pytest.raises(WaitTimeoutError):
         robot.camera.photo(timeout=0.1)  # nobody is pushing any more
 
 
-def test_capture_clip_records_both_streams_and_writes_a_wav(livekit_robot, tmp_path):
+def test_capture_clip_records_both_streams_and_writes_a_wav(clock, livekit_robot, tmp_path):
     client, robot = livekit_robot
     robot.camera.latest()  # attach before the feeder starts
     robot.microphone.latest()
-    stop = threading.Event()
+    n = 0
 
-    def feed() -> None:
-        n = 0
-        while not stop.is_set():
-            n += 1
-            client.push_frame(n)
-            client.push_audio(n)
-            time.sleep(0.01)
+    def feed_once() -> None:
+        nonlocal n
+        n += 1
+        client.push_frame(n)
+        client.push_audio(n)
 
-    thread = threading.Thread(target=feed, daemon=True)
-    thread.start()
+    feeder = clock.call_every(0.01, feed_once)
     try:
         clip = robot.camera.capture_clip(0.2)
     finally:
-        stop.set()
-        thread.join(timeout=1.0)
+        feeder.cancel()
     assert isinstance(clip, Clip) and clip.frames and clip.audio
     assert clip.fps > 0 and clip.duration_s > 0
     out = clip.save_wav(tmp_path / "clip.wav")
@@ -355,20 +374,20 @@ def test_the_speaker_publishes_onto_the_room(livekit_robot):
 # ── media without state ───────────────────────────────────────────────────────
 
 
-def test_a_media_only_session_opens_without_state_and_refuses_to_drive(edge):
+def test_a_media_only_session_opens_without_state_and_refuses_to_drive(clock, edge):
     """The camera, microphone and speaker are the room's; the firmware need not be up for
     them. A session that does not wait for state gets the media at once, and every verb
     that would move the robot refuses until the robot has reported."""
     client = FakeLiveKitClient(edge, carry_state=False)  # no state track in this room
     tx = LiveKitTransport("ws://fake", "asimov-room", token="t", client=client)
     robot = Robot(tx, link_timeout=0.3)
-    started = time.monotonic()
+    started = clock.monotonic()
     robot.open(timeout=3.0, require_state=False)
     try:
-        assert time.monotonic() - started < 1.0, "a media-only open must not wait for state"
+        assert clock.monotonic() - started < 1.0, "a media-only open must not wait for state"
         assert robot.connected and robot.has("camera") and robot.has("speaker")
-        threading.Timer(0.02, client.push_frame, args=(1,)).start()
-        assert robot.camera.photo(timeout=1.0).sequence == 1
+        with feeding(client, 1):
+            assert robot.camera.photo(timeout=1.0).sequence == 1
         robot.speaker.play_pcm(bytes(320))
         assert len(client.played) == 1
         with pytest.raises(NotConnectedError, match="has not reported state"):
@@ -388,7 +407,7 @@ def test_a_media_only_session_opens_without_state_and_refuses_to_drive(edge):
             assert info.value.has("no_state")
         with pytest.raises(WaitTimeoutError):
             robot.wait_until(lambda s: s.mode is Mode.STAND, timeout=0.2)
-        time.sleep(0.8)  # well past link_timeout
+        clock.sleep(0.8)  # well past link_timeout
         assert robot.connected, "a stream that never started is not one that went quiet"
         assert [t for t in client.published if t[0] == COMMAND_TOPIC] == [], "nothing went out"
     finally:
@@ -413,16 +432,14 @@ def test_state_arriving_later_completes_the_handshake_and_unlocks_the_verbs(edge
         robot.close()
 
 
-def test_a_late_protocol_mismatch_is_raised_where_it_is_read_not_lost_in_a_log(edge):
+def test_a_late_protocol_mismatch_is_raised_where_it_is_read_not_lost_in_a_log(clock, edge):
     edge.pushing = False
     edge.state.protocol_version = 99
     _client, robot = make_livekit_robot(edge)
     robot.open(timeout=0.2, require_state=False)
     try:
         edge.pushing = True
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline and robot._handshake_error is None:
-            time.sleep(0.02)
+        clock.run_until(lambda: robot._handshake_error is not None, 3.0)
         with pytest.raises(ProtocolMismatchError) as info:
             _ = robot.get_state()
         assert info.value.observed == 99
@@ -547,7 +564,7 @@ def test_bgr8_to_rgb_swaps_channels_without_flipping_the_image() -> None:
 def test_close_waits_for_every_stream_reader_to_close_its_stream():
     """close() lets each reader's aclose() run to the end before the loop stops; a real
     aclose() awaits a round trip to the native library, so a stream left mid-close stays
-    open."""
+    open. Real clock: the client's asyncio loop runs on its own thread."""
     client = _LiveKitClient("ws://x", "r", token="t")
     closed: list[str] = []
 

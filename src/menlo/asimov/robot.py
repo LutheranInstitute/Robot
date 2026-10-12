@@ -88,12 +88,11 @@ import logging
 import math
 import os
 import threading
-import time
 import weakref
 from collections.abc import Callable, Iterable, Iterator
 from typing import TYPE_CHECKING, Literal, Self
 
-from menlo.asimov import robots, store
+from menlo.asimov import _clock, robots, store
 from menlo.asimov._command import Command, Limits, ModeCommand, Trajectory, Velocity
 from menlo.asimov._errors import (
     CommandRefusedError,
@@ -257,7 +256,7 @@ class Robot:
         self._streamed = False
         self._generation = 0
         self._stop = threading.Event()
-        self._keepalive: threading.Thread | None = None
+        self._keepalive: _clock.Loop | None = None
         self._pending: collections.OrderedDict[int, Sent] = collections.OrderedDict()
         self._last_mode: Sent | None = None  # the stand/damp/trajectory a wait may be waiting on
         self._subscribed = False
@@ -529,7 +528,7 @@ class Robot:
         # Verbs stay refused (NotConnectedError) until the handshake has passed: here, or
         # in _on_state when the session did not wait for the robot.
         if require_state:
-            if not self._state_seen.wait(timeout):
+            if not _clock.wait(self._state_seen, timeout):
                 self._accepting = False
                 self._tx.close()
                 # A transport MAY carry a ``silence_hint``: what to check when a connect
@@ -554,10 +553,7 @@ class Robot:
         # thread's exit before it woke, leaving two keepalives re-sending into Asimov Edge.
         stop = threading.Event()
         self._stop = stop
-        self._keepalive = threading.Thread(
-            target=self._keepalive_loop, args=(stop,), name="menlo-sdk-keepalive", daemon=True
-        )
-        self._keepalive.start()
+        self._keepalive = self._start_keepalive(stop)
 
     def _handshake(self, first: State) -> None:
         """What the first state sample settles: the protocol version this SDK can speak,
@@ -653,9 +649,8 @@ class Robot:
         self._stop.set()
         if self._keepalive is not None:
             # close() may run on the keepalive thread itself (an on_link_lost handler that
-            # closes the robot); a thread cannot join itself, and it is exiting anyway.
-            if self._keepalive is not threading.current_thread():
-                self._keepalive.join(timeout=2.0)
+            # closes the robot); join() returns at once there, and the loop is exiting anyway.
+            self._keepalive.join(timeout=2.0)
             self._keepalive = None
         if tx is None:
             return
@@ -801,7 +796,7 @@ class Robot:
         link or a protocol mismatch raises its own error at once. What the robot reports
         (a fault, an alert, a hot joint, the robot mode) never refuses here. From a state
         callback it checks once: waiting there would hold up the state it waits for."""
-        deadline = time.monotonic() + (0.0 if _in_callback() else timeout)
+        deadline = _clock.monotonic() + (0.0 if _in_callback() else timeout)
         while True:
             self._usable()
             check = self.preflight(action)
@@ -810,13 +805,13 @@ class Robot:
                 return check
             if not all(p.code in TRANSIENT for p in check.blocking):
                 raise NotReadyError(check.explain(), action=action, preflight=check)
-            if time.monotonic() >= deadline:
+            if _clock.monotonic() >= deadline:
                 if check.ok:
                     return check  # the STAND report did not come: send anyway
                 raise NotReadyError(
                     f"{check.explain()} (waited {timeout:.1f} s)", action=action, preflight=check
                 )
-            time.sleep(READY_POLL_S)
+            _clock.sleep(READY_POLL_S)
 
     def _stand_pending(self) -> bool:
         """A STAND went out moments ago and the robot still reports DAMP: the report is on
@@ -825,7 +820,7 @@ class Robot:
         return (
             last is not None
             and last.name == "stand"
-            and time.monotonic() - last.sent_at < STAND_REPORT_S
+            and _clock.monotonic() - last.sent_at < STAND_REPORT_S
             and s is not None
             and s.mode is Mode.DAMP
         )
@@ -933,7 +928,7 @@ class Robot:
                 # that another verb, close() or a lost link ended the time.
                 self._hold_done = threading.Event()
                 if not v.is_zero:
-                    self._latch_deadline = time.monotonic() + duration
+                    self._latch_deadline = _clock.monotonic() + duration
             self._last_mode = None  # a new drive supersedes whatever posture change preceded it
             done = self._hold_done
             sent = self._send(name, v, gen, clamped=(v != asked))
@@ -956,18 +951,18 @@ class Robot:
 
     def _await_hold(self, done: threading.Event | None, duration: float, sent: Sent) -> None:
         assert done is not None
-        started = time.monotonic()
+        started = _clock.monotonic()
         if isinstance(sent.command, Velocity) and sent.command.is_zero:
             # Nothing is held: the robot balances for `duration`, and the wait watches the
             # session and the robot's report as a hold's wait does.
             end = started + duration
-            while not done.wait(max(0.0, min(READY_POLL_S, end - time.monotonic()))):
+            while not _clock.wait(done, max(0.0, min(READY_POLL_S, end - _clock.monotonic()))):
                 if self._closed or self._link_lost is not None:
                     break
                 s = self._state
                 if s is not None and s.faulted and s.mode in _DOWN:
                     raise self._walk_faulted(s, started, duration, sent)
-                if time.monotonic() >= end:
+                if _clock.monotonic() >= end:
                     return
         else:
             # The keepalive ticks at KEEPALIVE_HZ, so the zero leaves within a tick of the
@@ -975,7 +970,7 @@ class Robot:
             # set on every path that ends a hold, so running out of it means the keepalive
             # is stalled or gone: the hold is ended and its zero sent from here.
             budget = duration + 2.0 / KEEPALIVE_HZ + 1.0
-            if not done.wait(budget):
+            if not _clock.wait(done, budget):
                 with self._lock:
                     stalled = self._hold_done is done
                     if stalled:
@@ -1011,7 +1006,7 @@ class Robot:
         names = ", ".join(fault_names(s)) or f"robot mode {s.mode.name}"
         check = self.preflight("move")
         return RobotFaultedError(
-            f"the walk ended after {time.monotonic() - started:.1f} s of {duration:.1f} s: "
+            f"the walk ended after {_clock.monotonic() - started:.1f} s of {duration:.1f} s: "
             f"the firmware latched DAMP ({names}); it stays latched until the firmware "
             "restarts, and nothing the SDK sends clears it",
             state=s,
@@ -1042,7 +1037,7 @@ class Robot:
         The robot mode decides, not what this session sent before: outside MOVE a velocity
         hold still in force ends at once (nothing more is re-sent)."""
         _nonnegative_finite("timeout", timeout)
-        deadline = time.monotonic() + timeout
+        deadline = _clock.monotonic() + timeout
         self._usable()
         with self._lock:
             s = self._state
@@ -1072,7 +1067,7 @@ class Robot:
         try:
             self._wait(
                 lambda st: st.mode is Mode.MOVE,
-                timeout=max(0.0, deadline - time.monotonic()),
+                timeout=max(0.0, deadline - _clock.monotonic()),
                 action="move",
                 sent=sent,
             )
@@ -1129,14 +1124,14 @@ class Robot:
         supported."""
         _nonnegative_finite("timeout", timeout)
         _no_wait_in_callback("stand", wait)
-        deadline = time.monotonic() + timeout
+        deadline = _clock.monotonic() + timeout
         self._ready("stand", timeout)
         sent = self._once("stand", ModeCommand("stand"))
         if wait:
             try:
                 self._wait(
                     lambda s: s.mode is Mode.STAND and self.armed is not False,
-                    timeout=max(0.0, deadline - time.monotonic()),
+                    timeout=max(0.0, deadline - _clock.monotonic()),
                     action="stand",
                     sent=sent,
                 )
@@ -1285,7 +1280,7 @@ class Robot:
         if timeout is not None:
             _nonnegative_finite("timeout", timeout)
         _no_wait_in_callback("set_joints", wait)
-        begun = time.monotonic()
+        begun = _clock.monotonic()
         # The live-state check also guarantees a fresh pose to plan from.
         self._ready("trajectory", READY_TIMEOUT_S if timeout is None else timeout)
         start = self.get_state().joint_pos
@@ -1317,28 +1312,37 @@ class Robot:
             first = self._send("trajectory", opening, gen)
             self._last_mode = first
 
-        def run() -> None:
-            i = 2
-            while True:
-                # Clock the motion at `hz`; once the target is reached keep re-sending it at
-                # the keepalive rate: Asimov Edge DAMPs a trajectory two seconds after the last
-                # setpoint, so a reached pose must be held until another verb takes over.
-                time.sleep(period if i <= steps else 1.0 / KEEPALIVE_HZ)
-                with self._lock:
-                    if self._generation != gen or self._closed:
-                        return  # superseded by another verb, or closed
-                try:
-                    self._send("trajectory", Trajectory(blend(min(i, steps)), kp_t, kd_t), gen)
-                except MenloError:
-                    return
-                i += 1
+        i = 1
 
-        threading.Thread(target=run, name="menlo-sdk-set-joints", daemon=True).start()
+        def step() -> float | None:
+            # Clock the motion at `hz`; once the target is reached keep re-sending it at
+            # the keepalive rate: Asimov Edge DAMPs a trajectory two seconds after the last
+            # setpoint, so a reached pose must be held until another verb takes over.
+            nonlocal i
+            i += 1
+            with self._lock:
+                if self._generation != gen or self._closed:
+                    return None  # superseded by another verb, or closed
+            try:
+                self._send("trajectory", Trajectory(blend(min(i, steps)), kp_t, kd_t), gen)
+            except MenloError:
+                return None
+            return period if i < steps else 1.0 / KEEPALIVE_HZ
+
+        # The first re-send comes a period after the opening setpoint while the motion is
+        # still blending (steps > 1); a one-step motion is at its target already and holds
+        # it at the hold rate from the start.
+        _clock.run_loop(
+            "menlo-sdk-set-joints",
+            step,
+            delay=period if steps > 1 else 1.0 / KEEPALIVE_HZ,
+            stop=None,
+        )
         if wait:
             limit = (
                 duration + 2.0
                 if timeout is None
-                else max(0.0, timeout - (time.monotonic() - begun))
+                else max(0.0, timeout - (_clock.monotonic() - begun))
             )
             try:
                 self._wait(
@@ -1403,7 +1407,7 @@ class Robot:
             if stale_after is None
             else _positive_finite("stale_after", stale_after)
         )
-        deadline = time.monotonic() + timeout
+        deadline = _clock.monotonic() + timeout
         last: State | None = None
         while True:
             if self._closed:  # a cached sample from a closed session must not satisfy a wait
@@ -1441,7 +1445,7 @@ class Robot:
             pending_mode = self._last_mode  # only the command still in force can refuse a wait
             if pending_mode is not None and isinstance(pending_mode.outcome, Refused):
                 raise CommandRefusedError(pending_mode.outcome)
-            if time.monotonic() >= deadline:
+            if _clock.monotonic() >= deadline:
                 raise WaitTimeoutError(
                     f"the condition was not met within {timeout:.1f} s"
                     + (
@@ -1452,7 +1456,7 @@ class Robot:
                     last=last,
                     sent=sent,
                 )
-            time.sleep(poll)
+            _clock.sleep(poll)
 
     def outcomes(self) -> Iterator[Refused]:
         """Drain refusals received so far, oldest first. The drain happens NOW, under the
@@ -1522,10 +1526,12 @@ class Robot:
             self._call(on_sent, sent)
         return sent
 
-    def _keepalive_loop(self, stop: threading.Event) -> None:
+    def _start_keepalive(self, stop: threading.Event) -> _clock.Loop:
         interval = 1.0 / KEEPALIVE_HZ
-        last_seen = time.monotonic()
-        while not stop.wait(interval):
+        last_seen = _clock.monotonic()
+
+        def step() -> float | None:
+            nonlocal last_seen
             s = self._state
             if s is not None:
                 last_seen = s.received_at
@@ -1533,9 +1539,9 @@ class Robot:
                 # A session that did not wait for the robot and has not heard it: a
                 # stream that never started is not one that went quiet, and no verb has
                 # been accepted, so there is nothing to zero.
-                last_seen = time.monotonic()
-                continue
-            if time.monotonic() - last_seen > self.link_timeout and self._link_lost is None:
+                last_seen = _clock.monotonic()
+                return interval
+            if _clock.monotonic() - last_seen > self.link_timeout and self._link_lost is None:
                 quiet = f"no state from {self._tx.endpoint} for {self.link_timeout:.1f}s"
 
                 def lost(zeroed: bool, quiet: str = quiet) -> LinkLostError:
@@ -1549,7 +1555,7 @@ class Robot:
             expired: threading.Event | None = None
             with self._lock:
                 v, gen, deadline = self._latched, self._generation, self._latch_deadline
-                if v is not None and deadline is not None and time.monotonic() >= deadline:
+                if v is not None and deadline is not None and _clock.monotonic() >= deadline:
                     # The bounded hold expired: send zero once and stop holding. Whoever is
                     # blocked in wait=True is released AFTER that zero has gone out.
                     expired, self._hold_done = self._hold_done, None
@@ -1557,18 +1563,21 @@ class Robot:
                     self._generation += 1
                     v, gen = Velocity(), self._generation
             if v is None:
-                continue
+                return interval
             try:
                 self._send("set_velocity", v, gen)
             except (LinkLostError, NotConnectedError):
-                return
+                return None
             except Exception as exc:  # a transport bug must not silently end the hold
                 log.exception("keepalive send failed; declaring the link lost")
                 self._mark_link_lost(LinkLostError(f"keepalive send failed: {exc!r}"))
-                return
+                return None
             finally:
                 if expired is not None:
                     expired.set()
+            return interval
+
+        return _clock.run_loop("menlo-sdk-keepalive", step, delay=interval, stop=stop)
 
     def _mark_link_lost(self, exc: LinkLostError | Callable[[bool], LinkLostError]) -> None:
         """End the session: ``exc`` is raised by every verb and wait from now on. A callable
@@ -1788,7 +1797,7 @@ class Robot:
         absent block decodes the same as "no alerts". Carry the last block forward for
         ``ALERT_HOLD_S`` so ``state.alerts``, ``faulted`` and ``on_alert`` are stable
         per sample; a cleared alert lingers at most that long."""
-        now = time.monotonic()
+        now = _clock.monotonic()
         if state.alerts:
             self._last_alerts, self._last_alerts_at = state.alerts, now
             return state

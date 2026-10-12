@@ -15,7 +15,6 @@ import argparse
 import contextlib
 import json
 import math
-import time
 from dataclasses import astuple
 from typing import Any
 
@@ -30,6 +29,7 @@ from menlo.asimov import (
     StateStaleError,
     Velocity,
     WaitTimeoutError,
+    _clock,
 )
 from menlo.asimov._preflight import MAX_STATE_AGE_S, fault_names
 from menlo.cli._common import (
@@ -147,7 +147,7 @@ def status(args: argparse.Namespace) -> int:
     with connected(args) as robot:
         rate = StateRate(robot)
         if not args.watch:
-            time.sleep(RATE_WINDOW_S)
+            _clock.sleep(RATE_WINDOW_S)
             snap = snapshot(robot, rate)
             if args.json:
                 print(json.dumps(snap, indent=2))
@@ -167,7 +167,7 @@ def status(args: argparse.Namespace) -> int:
         ):
             try:
                 while pressed() not in ("q", "Q"):
-                    time.sleep(0.25)
+                    _clock.sleep(0.25)
                     live.update(render(snapshot(robot, rate)), refresh=True)
             except KeyboardInterrupt:
                 pass
@@ -203,13 +203,13 @@ def live(robot: Robot, action: Action) -> None:
 
 def _see_armed(robot: Robot) -> None:
     """In STAND, give the session ``ARM_SEEN_S`` to see an armed robot as armed."""
-    deadline = time.monotonic() + ARM_SEEN_S
+    deadline = _clock.monotonic() + ARM_SEEN_S
     while (
         robot.get_state().mode is Mode.STAND
         and robot.armed is False
-        and time.monotonic() < deadline
+        and _clock.monotonic() < deadline
     ):
-        time.sleep(0.05)
+        _clock.sleep(0.05)
 
 
 def facts(robot: Robot) -> list[str]:
@@ -327,7 +327,7 @@ def walk(args: argparse.Namespace) -> int:
         if not go_ahead(args, robot, doing):
             return EXIT_CANCELLED
         _say("Walking. Ctrl-C ends the walk.")
-        started = time.monotonic()
+        started = _clock.monotonic()
         try:
             sent = robot.set_velocity(
                 *speeds, duration=args.duration, wait=True, timeout=ARM_TIMEOUT_S
@@ -338,7 +338,7 @@ def walk(args: argparse.Namespace) -> int:
             with contextlib.suppress(MenloError):
                 robot.balance()
             raise
-        walked = time.monotonic() - started
+        walked = _clock.monotonic() - started
         s = robot.get_state()
         if s.mode is Mode.MOVE:
             robot.balance()
@@ -384,7 +384,7 @@ def balance(args: argparse.Namespace) -> int:
             )
             return EXIT_OK
         robot.balance()
-        time.sleep(0.1)
+        _clock.sleep(0.1)
         # A datagram can be lost, so a second zero follows, but only to a robot still
         # reported in MOVE.
         s = robot.get_state()

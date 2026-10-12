@@ -89,6 +89,8 @@ class FakeMediaTransport:
 
 @pytest.fixture
 def media():
+    """Real clock: the camera's and microphone's waits are condition variables, fed here
+    from real threads and timers."""
     tx = FakeMediaTransport()
     robot = Robot(tx)
     robot.open(timeout=1.0, allow_version_skew=True)
@@ -151,16 +153,11 @@ def test_the_udp_lane_says_unsupported_not_silence(edge, robot):
     assert isinstance(info.value, Exception) and Velocity().is_zero  # sanity, imports used
 
 
-def test_battery_is_a_capability_when_the_robot_reports_one(edge):
+def test_battery_is_a_capability_when_the_robot_reports_one(clock, edge):
     edge.state.battery.voltage_v = 48.2
     edge.state.battery.soc_percent = 77.0
-    time.sleep(0.05)
-    with connect_udp(
-        "127.0.0.1",
-        command_port=edge.command_port,
-        state_bind=("127.0.0.1", 0),
-        timeout=2,
-    ) as r:
+    clock.sleep(0.05)
+    with connect_udp(edge, timeout=2) as r:
         assert r.has("battery")
         assert (
             r.get_state().battery is not None

@@ -9,11 +9,12 @@ from tests.conftest import run_script_over
 
 
 def test_importing_the_sdk_and_driving_over_udp_loads_no_livekit_and_no_cli_libraries(
-    edge, tmp_path
+    loopback_edge, tmp_path
 ):
-    """A real loopback LAN connect and preflight keep media and CLI imports lazy."""
+    """A real loopback LAN connect and preflight keep media and CLI imports lazy. A child
+    interpreter over real sockets, on the real clock: what it imports is the point."""
     code, out, err = run_script_over(
-        edge,
+        loopback_edge,
         """
         import sys
         robot.get_state()
