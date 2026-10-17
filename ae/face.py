@@ -9,6 +9,7 @@ It never commands the robot.
 
 Run: python ae/face.py            (saved robot, or the MENLO_* environment variables)
      python ae/face.py --demo     (no robot: steps through every mood)
+     python ae/serve.py           (same, plus face.json / SSE / kiosk over HTTP)
 """
 
 from __future__ import annotations
@@ -16,7 +17,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+import itertools
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -72,33 +75,56 @@ def face(state, armed: bool | None) -> dict:
         "alerts": [a.name for a in state.alerts],
         "age_ms": round(state.age_s * 1000),
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "ts": round(time.time(), 3),  # unix seconds; added in 0.1, old readers ignore it
     }
 
 
-def publish(f: dict) -> None:
+_seq = itertools.count(1)
+_seq_lock = threading.Lock()
+
+
+def publish(f: dict) -> dict:
+    """Stamp seq (1, 2, 3 ... per process), print one line, write face.json atomically."""
+    with _seq_lock:
+        f["seq"] = next(_seq)
+    f.setdefault("ts", round(time.time(), 3))
     print(json.dumps(f, ensure_ascii=False), flush=True)
     d = os.path.dirname(os.path.abspath(OUT))
     with tempfile.NamedTemporaryFile("w", dir=d, delete=False, encoding="utf-8") as tmp:
         json.dump(f, tmp, ensure_ascii=False, indent=2)
     os.replace(tmp.name, OUT)  # atomic: a screen never reads half a face
+    return f
 
 
-def demo() -> None:
+def sample(mode, age=0.05, soc=80, faulted=False, alerts=()):
+    """A fake state sample shaped like the SDK's, for the demo and the tests."""
     from types import SimpleNamespace as N
 
-    def s(mode, age=0.05, soc=80, faulted=False):
-        return N(mode=N(name=mode), age_s=age, battery=N(soc_percent=soc), faulted=faulted, alerts=[])
+    battery = None if soc is None else N(soc_percent=soc)
+    return N(mode=N(name=mode), age_s=age, battery=battery, faulted=faulted,
+             alerts=[N(name=a) for a in alerts])
 
-    steps = [
-        (s("DAMP"), None), (s("STAND"), False), (s("STAND"), True), (s("MOVE"), True),
-        (s("MOVE", soc=15), True), (s("MOVE", age=1.2), True), (s("FAULT_DAMP", faulted=True), None),
+
+def demo_steps():
+    """One (state, armed) per mood, in the order sleep think ready work tired lost hold."""
+    return [
+        (sample("DAMP"), None), (sample("STAND"), False), (sample("STAND"), True),
+        (sample("MOVE"), True), (sample("MOVE", soc=15), True), (sample("MOVE", age=1.2), True),
+        (sample("FAULT_DAMP", faulted=True), None),
     ]
-    for state, armed in steps:
-        publish(face(state, armed))
-        time.sleep(0.3)
 
 
-def main() -> None:
+def demo(emit=publish, loop: bool = False, step_s: float = 0.3) -> None:
+    while True:
+        for state, armed in demo_steps():
+            emit(face(state, armed))
+            time.sleep(step_s)
+        if not loop:
+            return
+
+
+def main(emit=publish) -> None:
+    """Watch the robot and emit a face on every mood change. Reads only."""
     from menlo.asimov import Robot
 
     last = None
@@ -106,7 +132,7 @@ def main() -> None:
         while True:
             f = face(robot.get_state(), robot.armed)
             if f["mood"] != last:
-                publish(f)
+                emit(f)
                 last = f["mood"]
             time.sleep(PERIOD_S)
 
